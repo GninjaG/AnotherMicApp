@@ -190,6 +190,11 @@ impl Settings {
                     row(ui, "", |ui| {
                         label_muted(ui, t!("Usa o DeepFilterNet sem lookahead: uns 10 ms a menos, limpa um pouco pior e usa mais CPU.", "Uses DeepFilterNet without lookahead: about 10 ms less, slightly worse cleanup and more CPU."));
                     });
+                    if cfg.devices.output.to_lowercase().contains("cable") {
+                        row(ui, "", |ui| {
+                            ui.vertical(|ui| super::wizard::cable_latency_tip(ui));
+                        });
+                    }
                     let mut g = cfg.app.monitor_gain_db;
                     row(ui, t!("Volume da escuta", "Monitor volume"), |ui| {
                         ui.spacing_mut().slider_width = 300.0;
