@@ -1,6 +1,6 @@
 use super::graph::hz;
 use super::theme::*;
-use egui::{Color32, Rect, RichText, Sense, Stroke, pos2, vec2};
+use egui::{Color32, Rect, RichText, Sense, Stroke, Vec2, pos2, vec2};
 use micclean::fx::biquad::{BqParams, BqType, Width};
 use micclean::fx::chain::{BlockCfg, GeqMode, Kind};
 use micclean::fx::dynamics::CompParams;
@@ -28,6 +28,14 @@ pub enum Edit {
 pub struct Cards {
     pub open: BTreeSet<u32>,
     confirm_rm: Option<(u32, f64)>,
+    drag: Option<Drag>,
+    /// Topo (relativo à lista) e altura de cada card no último frame.
+    ys: BTreeMap<u32, (f32, f32)>,
+    order: Vec<u32>,
+    /// Deslocamento visual e velocidade de cada card que está se movendo.
+    off: BTreeMap<u32, (Vec2, Vec2)>,
+    /// Card solto que ainda está assentando por cima dos outros.
+    settle: Option<u32>,
 }
 
 pub struct Ctx<'a> {
@@ -107,183 +115,271 @@ fn close_x(ui: &mut egui::Ui, armed: bool) -> egui::Response {
     resp.on_hover_text(t!("Remover bloco", "Remove block"))
 }
 
+struct Drag {
+    id: u32,
+    /// Ponto do card onde o mouse pegou.
+    grab: Vec2,
+    pos: egui::Pos2,
+    to: usize,
+}
+
+/// Mola das posições: leve passada do alvo, assenta em ~0,3 s.
+fn spring(o: &mut Vec2, v: &mut Vec2, dt: f32) {
+    const K: f32 = 300.0;
+    let c = 2.0 * 0.78 * K.sqrt();
+    let n = (dt * 240.0).ceil().max(1.0);
+    let h = dt / n;
+    for _ in 0..n as usize {
+        *v += (-K * *o - c * *v) * h;
+        *o += *v * h;
+    }
+}
+
 impl Cards {
     pub fn show(&mut self, ui: &mut egui::Ui, blocks: &mut Vec<BlockCfg>, cx: &Ctx) -> Vec<Edit> {
         let mut edits = vec![];
-        let mut mv: Option<(usize, usize)> = None;
         let mut rm: Option<usize> = None;
+        let ctx = ui.ctx().clone();
         let now = ui.input(|i| i.time);
+        let dt = ui.input(|i| i.stable_dt).min(0.05);
+        let anim = ctx.global_style().animation_time > 0.0;
         if let Some((_, t)) = self.confirm_rm {
             if now - t > 3.0 {
                 self.confirm_rm = None;
             }
         }
-        let dragging = egui::DragAndDrop::has_payload_of_type::<usize>(ui.ctx());
-        for i in 0..blocks.len() {
+        for (o, v) in self.off.values_mut() {
+            if anim {
+                spring(o, v, dt);
+            } else {
+                (*o, *v) = (Vec2::ZERO, Vec2::ZERO);
+            }
+        }
+        self.off.retain(|_, (o, v)| o.length() > 0.3 || v.length() > 2.0);
+        let sp = ui.spacing().item_spacing.y;
+        let top = ui.cursor().top();
+        let x0 = ui.cursor().left();
+        let w = ui.available_width();
+        let pointer = ui.input(|i| i.pointer.interact_pos());
+        let held = ui.input(|i| i.pointer.primary_down());
+
+        let src = self.drag.as_ref().and_then(|d| blocks.iter().position(|b| b.id == d.id));
+        if src.is_none() {
+            self.drag = None;
+        }
+        if let Some(d) = &mut self.drag {
+            if let Some(p) = pointer {
+                d.pos = p;
+            }
+            let hd = self.ys.get(&d.id).map_or(40.0, |v| v.1);
+            let center = d.pos.y - d.grab.y + hd / 2.0 - top;
+            let (mut y, mut to) = (0.0, 0);
+            for b in blocks.iter().filter(|b| b.id != d.id) {
+                let h = self.ys.get(&b.id).map_or(40.0, |v| v.1);
+                if y + h / 2.0 < center {
+                    to += 1;
+                }
+                y += h + sp;
+            }
+            d.to = to;
+            // perto da borda: rola a lista
+            if let Some(p) = pointer {
+                let clip = ui.clip_rect();
+                let k = if p.y < clip.top() + 36.0 {
+                    clip.top() + 36.0 - p.y
+                } else if p.y > clip.bottom() - 36.0 {
+                    clip.bottom() - 36.0 - p.y
+                } else {
+                    0.0
+                };
+                if k != 0.0 {
+                    ui.scroll_with_delta(vec2(0.0, k.clamp(-36.0, 36.0) * 0.4));
+                }
+            }
+            ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+        }
+        let mut order: Vec<usize> = (0..blocks.len()).collect();
+        if let (Some(d), Some(s)) = (&self.drag, src) {
+            let x = order.remove(s);
+            order.insert(d.to.min(order.len()), x);
+        }
+        let ids: Vec<u32> = order.iter().map(|&i| blocks[i].id).collect();
+        let reflow = anim && ids != self.order;
+        let drag_layer = egui::LayerId::new(egui::Order::Foreground, egui::Id::unique("card-drag"));
+
+        for (k, &i) in order.iter().enumerate() {
             let id = blocks[i].id;
-            let open = self.open.contains(&id);
-            let failed = cx.errs.contains_key(&id) || cx.vst.get(&id).is_some_and(|p| p.failed.load(Relaxed));
-            let hi = ui.ctx().animate_bool_responsive(ui.scope_id().with(("card-hi", id)), cx.sel == Some(id));
-            let mut frame = card_frame_t(hi);
-            if failed {
-                frame = frame.stroke(Stroke::new(1.0, ERR));
+            let y_nat = ui.cursor().top() - top;
+            let dragged = self.drag.as_ref().is_some_and(|d| d.id == id);
+            if reflow && !dragged {
+                if let Some(&(py, _)) = self.ys.get(&id) {
+                    self.off.entry(id).or_default().0.y += py - y_nat;
+                }
             }
-            let a = appear(ui.ctx(), ui.scope_id().with(("card-in", id)));
-            let fr = ui.scope(|ui| {
-                ui.multiply_opacity(a);
-                frame.show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.horizontal(|ui| {
-                    let g = grip(ui);
-                    if g.dragged() {
-                        g.dnd_set_drag_payload(i);
-                    }
-                    let b = &mut blocks[i];
-                    if toggle(ui, &mut b.enabled).changed() {
-                        edits.push(Edit::Enable(id));
-                    }
-                    ui.add_space(2.0);
-                    let title_col = if b.enabled { TEXT } else { MUTED };
-                    let (title, sub) = match &b.kind {
-                        Kind::Vst { .. } => (subtitle(b, cx.vst), t!("Plugin VST", "VST plugin").to_string()),
-                        k => (title(k).to_string(), subtitle(b, cx.vst)),
-                    };
-                    let head = ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let armed = self.confirm_rm.is_some_and(|(x, _)| x == id);
-                        if close_x(ui, armed).clicked() {
-                            if armed {
-                                rm = Some(i);
-                                self.confirm_rm = None;
-                            } else {
-                                self.confirm_rm = Some((id, now));
-                            }
-                        }
-                        let ch = chevron(ui, open);
-                        if let Some(&d) = cx.meters.get(&id).filter(|d| d.is_finite() && b.enabled) {
-                            let c = if d.abs() < 0.5 { FAINT } else if d > 3.0 { WARN } else { MUTED };
-                            let s = if d < -60.0 { "< -60 dB".to_string() } else { format!("{d:+.1} dB") };
-                            ui.label(RichText::new(s).monospace().size(11.5).color(c))
-                                .on_hover_text(t!("Quanto este bloco muda o nível agora", "How much this block changes the level right now"));
-                        }
-                        let rest = ui.available_rect_before_wrap();
-                        let area = ui.interact(rest, ui.scope_id().with(("head", id)), Sense::click());
-                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                            ui.label(RichText::new(title).font(semibold(14.0)).color(title_col));
-                            ui.add(egui::Label::new(RichText::new(sub).color(FAINT).size(12.5)).truncate());
-                        });
-                        ch.clicked() || area.clicked()
-                    });
-                    if head.inner {
-                        if open {
-                            self.open.remove(&id);
-                        } else {
-                            self.open.insert(id);
-                        }
-                        edits.push(Edit::Select(id));
-                    }
-                });
-                if let Some(e) = cx.errs.get(&id) {
-                    ui.label(RichText::new(e).color(ERR).size(12.5));
-                } else if cx.vst.get(&id).is_some_and(|p| p.failed.load(Relaxed)) {
-                    ui.label(RichText::new(t!("O plugin gerou som inválido e foi desligado. Ligue de novo para recarregar.", "The plugin produced invalid audio and was turned off. Turn it on again to reload it.")).color(ERR).size(12.5));
-                }
-                let t = ui.ctx().animate_bool_responsive(ui.scope_id().with(("open", id)), open);
-                if t > 0.0 {
-                    ui.add_space(4.0 * t);
-                    let r = ui.max_rect();
-                    ui.painter().line_segment([pos2(r.left(), ui.cursor().top()), pos2(r.right(), ui.cursor().top())], Stroke::new(1.0, LINE));
-                    ui.add_space(8.0 * t);
-                    ui.scope(|ui| {
-                        ui.set_opacity(t);
-                        if let Some(e) = editor(ui, &mut blocks[i], cx) {
-                            edits.push(e);
-                            edits.push(Edit::Select(id));
-                        }
-                    });
-                }
-                })
-            })
-            .inner;
-            let resp = ui.interact(fr.response.rect, ui.scope_id().with(("card", id)), Sense::hover());
-            if fr.response.clicked() {
-                edits.push(Edit::Select(id));
+            let lift = ctx.animate_bool_responsive(egui::Id::unique(("card-lift", id)), dragged);
+            let o = self.off.get(&id).map_or(Vec2::ZERO, |v| v.0);
+            let on_top = dragged || self.settle == Some(id);
+            let min = match &self.drag {
+                Some(d) if dragged => d.pos - d.grab,
+                _ => pos2(x0, top + y_nat) + o,
+            };
+            let mut b = egui::UiBuilder::new()
+                .id_salt(("card", id))
+                .max_rect(Rect::from_min_size(min, vec2(w, 100_000.0)))
+                .layout(egui::Layout::top_down(egui::Align::Min));
+            if on_top {
+                b = b.layer_id(drag_layer);
             }
-            if dragging {
-                if let (Some(src), Some(q)) = (resp.dnd_hover_payload::<usize>(), ui.input(|i| i.pointer.hover_pos())) {
-                    let before = q.y < fr.response.rect.center().y;
-                    let y = if before { fr.response.rect.top() - 4.0 } else { fr.response.rect.bottom() + 4.0 };
-                    if *src != i {
-                        ui.painter().line_segment([pos2(fr.response.rect.left(), y), pos2(fr.response.rect.right(), y)], Stroke::new(2.0, ACCENT));
-                    }
-                    if let Some(src) = resp.dnd_release_payload::<usize>() {
-                        let mut to = if before { i } else { i + 1 };
-                        if *src < to {
-                            to -= 1;
-                        }
-                        if *src != to {
-                            mv = Some((*src, to));
-                        }
-                    }
+            let mut child = ui.new_child(b);
+            if on_top {
+                child.set_clip_rect(ctx.content_rect());
+            }
+            let shadow = on_top.then(|| child.painter().add(egui::Shape::Noop));
+            let (r, grip) = self.card(&mut child, blocks, i, cx, now, &mut edits, &mut rm);
+            if let Some(idx) = shadow {
+                let sh = egui::Shadow { offset: [0, 10], blur: 28, spread: 0, color: Color32::from_black_alpha((150.0 * lift) as u8) };
+                child.painter().set(idx, sh.as_shape(r, 10));
+            }
+            if on_top && lift > 0.0 {
+                let c = r.center().to_vec2();
+                let t = egui::emath::TSTransform::from_translation(c)
+                    * egui::emath::TSTransform::from_scaling(1.0 + 0.025 * lift)
+                    * egui::emath::TSTransform::from_translation(-c);
+                ctx.transform_layer_shapes(drag_layer, t);
+            }
+            self.ys.insert(id, (y_nat, r.height()));
+            ui.allocate_exact_size(vec2(w, r.height()), Sense::hover());
+            if grip.drag_started() && self.drag.is_none() {
+                if let Some(p) = pointer {
+                    self.drag = Some(Drag { id, grab: p - r.min, pos: p, to: k });
+                    self.settle = None;
+                    self.off.remove(&id);
                 }
+            }
+            if self.settle == Some(id) && lift <= 0.0 && !self.off.contains_key(&id) {
+                self.settle = None;
             }
         }
-        if let Some(src) = egui::DragAndDrop::payload::<usize>(ui.ctx()) {
-            if let (Some(b), Some(q)) = (blocks.get(*src), ui.input(|i| i.pointer.hover_pos())) {
-                let p = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::unique("dnd-ghost")));
-                let g = p.layout_no_wrap(title(&b.kind).to_string(), semibold(13.0), TEXT);
-                let r = Rect::from_min_size(q + vec2(14.0, -10.0), g.size() + vec2(18.0, 10.0));
-                p.rect_filled(r, 8, CARD_HI);
-                p.rect_stroke(r, 8, Stroke::new(1.0, ACCENT_DIM), egui::StrokeKind::Inside);
-                p.galley(r.min + vec2(9.0, 5.0), g, TEXT);
-                ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+        self.order = ids;
+
+        if self.drag.is_some() && !held {
+            let d = self.drag.take().unwrap();
+            if let Some(s) = blocks.iter().position(|b| b.id == d.id) {
+                let to = d.to.min(blocks.len() - 1);
+                if s != to {
+                    let x = blocks.remove(s);
+                    blocks.insert(to, x);
+                    edits.push(Edit::Structure);
+                }
+                if let Some(&(y, _)) = self.ys.get(&d.id) {
+                    if anim {
+                        self.off.insert(d.id, (d.pos - d.grab - pos2(x0, top + y), Vec2::ZERO));
+                    }
+                    self.settle = Some(d.id);
+                }
             }
-        }
-        if let Some((a, b)) = mv {
-            let x = blocks.remove(a);
-            blocks.insert(b, x);
-            edits.push(Edit::Structure);
         }
         if let Some(i) = rm {
             let b = blocks.remove(i);
             self.open.remove(&b.id);
             edits.push(Edit::Structure);
         }
+        if self.drag.is_some() || !self.off.is_empty() || self.settle.is_some() {
+            ctx.request_repaint();
+        }
         edits
     }
-}
 
-fn seg(ui: &mut egui::Ui, items: &[&str], cur: usize) -> Option<usize> {
-    let mut out = None;
-    egui::Frame::new().fill(BG).corner_radius(8).inner_margin(3).show(ui, |ui| {
-        ui.spacing_mut().item_spacing.x = 2.0;
-        ui.horizontal(|ui| {
-            let base = ui.scope_id().with("seg");
-            let bg = ui.painter().add(egui::Shape::Noop);
-            let x0 = ui.max_rect().left();
-            let mut rects = vec![];
-            for (k, it) in items.iter().enumerate() {
-                let on = k == cur;
-                let t = ui.ctx().animate_bool_responsive(base.with(k), on);
-                let b = egui::Button::new(RichText::new(*it).size(12.5).color(lerp(MUTED, Color32::WHITE, t)))
-                    .fill(Color32::TRANSPARENT)
-                    .corner_radius(6)
-                    .min_size(vec2(0.0, 24.0));
-                let r = ui.add(b);
-                if r.clicked() && !on {
-                    out = Some(k);
-                }
-                rects.push(r.rect);
-            }
-            if let Some(r) = rects.get(cur) {
-                let ctx = ui.ctx();
-                let tm = ctx.global_style().animation_time;
-                let l = x0 + ctx.animate_value_with_time(base.with("l"), r.left() - x0, tm);
-                let rt = x0 + ctx.animate_value_with_time(base.with("r"), r.right() - x0, tm);
-                ui.painter().set(bg, egui::Shape::rect_filled(Rect::from_x_y_ranges(l..=rt, r.y_range()), 6, ACCENT_DIM));
-            }
-        });
-    });
-    out
+    #[allow(clippy::too_many_arguments)]
+    fn card(&mut self, ui: &mut egui::Ui, blocks: &mut [BlockCfg], i: usize, cx: &Ctx, now: f64, edits: &mut Vec<Edit>, rm: &mut Option<usize>) -> (Rect, egui::Response) {
+        let id = blocks[i].id;
+        let open = self.open.contains(&id);
+        let failed = cx.errs.contains_key(&id) || cx.vst.get(&id).is_some_and(|p| p.failed.load(Relaxed));
+        let hi = ui.ctx().animate_bool_responsive(egui::Id::unique(("card-hi", id)), cx.sel == Some(id));
+        let mut frame = card_frame_t(hi);
+        if failed {
+            frame = frame.stroke(Stroke::new(1.0, ERR));
+        }
+        let a = appear(ui.ctx(), egui::Id::unique(("card-in", id)));
+        let mut grip_resp = None;
+        let fr = ui
+            .scope(|ui| {
+                ui.multiply_opacity(a);
+                frame.show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        grip_resp = Some(grip(ui));
+                        let b = &mut blocks[i];
+                        if toggle(ui, &mut b.enabled).changed() {
+                            edits.push(Edit::Enable(id));
+                        }
+                        ui.add_space(2.0);
+                        let title_col = if b.enabled { TEXT } else { MUTED };
+                        let (title, sub) = match &b.kind {
+                            Kind::Vst { .. } => (subtitle(b, cx.vst), t!("Plugin VST", "VST plugin").to_string()),
+                            k => (title(k).to_string(), subtitle(b, cx.vst)),
+                        };
+                        let head = ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let armed = self.confirm_rm.is_some_and(|(x, _)| x == id);
+                            if close_x(ui, armed).clicked() {
+                                if armed {
+                                    *rm = Some(i);
+                                    self.confirm_rm = None;
+                                } else {
+                                    self.confirm_rm = Some((id, now));
+                                }
+                            }
+                            let ch = chevron(ui, open);
+                            if let Some(&d) = cx.meters.get(&id).filter(|d| d.is_finite() && b.enabled) {
+                                let c = if d.abs() < 0.5 { FAINT } else if d > 3.0 { WARN } else { MUTED };
+                                let s = if d < -60.0 { "< -60 dB".to_string() } else { format!("{d:+.1} dB") };
+                                ui.label(RichText::new(s).monospace().size(11.5).color(c))
+                                    .on_hover_text(t!("Quanto este bloco muda o nível agora", "How much this block changes the level right now"));
+                            }
+                            let rest = ui.available_rect_before_wrap();
+                            let area = ui.interact(rest, ui.scope_id().with(("head", id)), Sense::click());
+                            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                                ui.label(RichText::new(title).font(semibold(14.0)).color(title_col));
+                                ui.add(egui::Label::new(RichText::new(sub).color(FAINT).size(12.5)).truncate());
+                            });
+                            ch.clicked() || area.clicked()
+                        });
+                        if head.inner {
+                            if open {
+                                self.open.remove(&id);
+                            } else {
+                                self.open.insert(id);
+                            }
+                            edits.push(Edit::Select(id));
+                        }
+                    });
+                    if let Some(e) = cx.errs.get(&id) {
+                        ui.label(RichText::new(e).color(ERR).size(12.5));
+                    } else if cx.vst.get(&id).is_some_and(|p| p.failed.load(Relaxed)) {
+                        ui.label(RichText::new(t!("O plugin gerou som inválido e foi desligado. Ligue de novo para recarregar.", "The plugin produced invalid audio and was turned off. Turn it on again to reload it.")).color(ERR).size(12.5));
+                    }
+                    let t = ui.ctx().animate_bool_responsive(egui::Id::unique(("card-open", id)), open);
+                    if t > 0.0 {
+                        ui.add_space(4.0 * t);
+                        let r = ui.max_rect();
+                        ui.painter().line_segment([pos2(r.left(), ui.cursor().top()), pos2(r.right(), ui.cursor().top())], Stroke::new(1.0, LINE));
+                        ui.add_space(8.0 * t);
+                        ui.scope(|ui| {
+                            ui.set_opacity(t);
+                            if let Some(e) = editor(ui, &mut blocks[i], cx) {
+                                edits.push(e);
+                                edits.push(Edit::Select(id));
+                            }
+                        });
+                    }
+                })
+            })
+            .inner;
+        if fr.response.clicked() {
+            edits.push(Edit::Select(id));
+        }
+        (fr.response.rect, grip_resp.unwrap())
+    }
 }
 
 fn editor(ui: &mut egui::Ui, b: &mut BlockCfg, cx: &Ctx) -> Option<Edit> {

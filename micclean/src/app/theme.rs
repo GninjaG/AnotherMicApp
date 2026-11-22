@@ -248,3 +248,91 @@ pub fn param(ui: &mut egui::Ui, name: &str, v: &mut f64, range: std::ops::RangeI
     changed |= ui.add(s).changed();
     changed
 }
+
+/// Interruptor com o texto ao lado (o texto também alterna).
+pub fn switch(ui: &mut egui::Ui, on: &mut bool, label: &str) -> bool {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 8.0;
+        let r = toggle(ui, on);
+        let mut c = r.changed();
+        let t = ui.ctx().animate_bool_responsive(r.id.with("label"), *on);
+        let l = ui.add(egui::Label::new(egui::RichText::new(label).color(lerp(MUTED, TEXT, t))).sense(egui::Sense::click()));
+        if l.clicked() {
+            *on = !*on;
+            c = true;
+        }
+        c
+    })
+    .inner
+}
+
+/// Seletor segmentado; o destaque desliza até a opção escolhida.
+pub fn seg(ui: &mut egui::Ui, items: &[&str], cur: usize) -> Option<usize> {
+    let mut out = None;
+    egui::Frame::new().fill(BG).corner_radius(8).inner_margin(3).show(ui, |ui| {
+        ui.spacing_mut().item_spacing.x = 2.0;
+        ui.horizontal(|ui| {
+            let base = ui.next_auto_id().with("seg");
+            let bg = ui.painter().add(egui::Shape::Noop);
+            let x0 = ui.max_rect().left();
+            let mut rects = vec![];
+            for (k, it) in items.iter().enumerate() {
+                let on = k == cur;
+                let t = ui.ctx().animate_bool_responsive(ui.next_auto_id().with("on"), on);
+                let b = egui::Button::new(egui::RichText::new(*it).size(12.5).color(lerp(MUTED, Color32::WHITE, t)))
+                    .fill(Color32::TRANSPARENT)
+                    .corner_radius(6)
+                    .min_size(egui::vec2(0.0, 24.0));
+                let r = ui.add(b);
+                if r.clicked() && !on {
+                    out = Some(k);
+                }
+                rects.push(r.rect);
+            }
+            if let Some(r) = rects.get(cur) {
+                let ctx = ui.ctx();
+                let tm = ctx.global_style().animation_time;
+                let l = x0 + ctx.animate_value_with_time(base.with("l"), r.left() - x0, tm);
+                let rt = x0 + ctx.animate_value_with_time(base.with("r"), r.right() - x0, tm);
+                ui.painter().set(bg, egui::Shape::rect_filled(Rect::from_x_y_ranges(l..=rt, r.y_range()), 6, ACCENT_DIM));
+            }
+        });
+    });
+    out
+}
+
+/// Contorno de coração com a ponta para baixo, centrado em `c`, com largura ~`s`.
+pub fn heart(c: egui::Pos2, s: f32, rot: f32, stroke: Stroke) -> egui::Shape {
+    let k = s / 34.0;
+    let (sn, cs) = rot.sin_cos();
+    let pts = (0..48)
+        .map(|i| {
+            let t = i as f32 / 48.0 * std::f32::consts::TAU;
+            let x = 16.0 * t.sin().powi(3) * k;
+            let y = -(13.0 * t.cos() - 5.0 * (2.0 * t).cos() - 2.0 * (3.0 * t).cos() - (4.0 * t).cos()) * k;
+            egui::pos2(c.x + x * cs - y * sn, c.y + x * sn + y * cs)
+        })
+        .collect();
+    egui::Shape::closed_line(pts, stroke)
+}
+
+/// Corações bem apagados subindo devagar pelo fundo de `rect`. Parados se `time` não muda.
+pub fn hearts(p: &egui::Painter, rect: Rect, time: f64) {
+    let n = 16;
+    for i in 0..n {
+        let h = |k: u32| {
+            let x = (i as u32).wrapping_mul(2654435761).wrapping_add(k.wrapping_mul(40503)) ^ 0x9e37_79b9;
+            (x.wrapping_mul(2246822519) >> 8) as f32 / (1u32 << 24) as f32
+        };
+        let size = 10.0 + 18.0 * h(1);
+        let speed = 5.0 + 9.0 * h(2);
+        let span = rect.height() + 60.0;
+        let y = rect.bottom() + 30.0 - ((h(3) * span + time as f32 * speed) % span);
+        let x = rect.left() + rect.width() * (0.04 + 0.92 * h(4)) + 10.0 * (time as f32 * 0.4 + h(5) * 6.0).sin();
+        let rot = 0.25 * (time as f32 * 0.3 + h(6) * 6.0).sin();
+        let edge = ((y - rect.top()) / 80.0).min((rect.bottom() - y) / 80.0).clamp(0.0, 1.0);
+        let a = (10.0 + 14.0 * h(7)) * edge;
+        let col = Color32::from_rgba_unmultiplied(ACCENT.r(), ACCENT.g(), ACCENT.b(), a as u8);
+        p.add(heart(egui::pos2(x, y), size, rot, Stroke::new(1.2, col)));
+    }
+}

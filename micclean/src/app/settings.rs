@@ -55,21 +55,36 @@ fn dev_combo(ui: &mut egui::Ui, id: &str, cur: &mut String, list: &[DevInfo], al
     c
 }
 
-fn section(ui: &mut egui::Ui, t: &str) {
-    ui.add_space(6.0);
-    ui.label(RichText::new(t).font(semibold(13.0)).color(ACCENT));
+const LABEL_W: f32 = 190.0;
+
+fn section(ui: &mut egui::Ui, t: &str, first: bool) {
+    ui.add_space(if first { 2.0 } else { 16.0 });
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(t).font(semibold(13.5)).color(ACCENT));
+        let r = ui.available_rect_before_wrap();
+        ui.painter().hline(r.left() + 4.0..=r.right(), r.center().y, egui::Stroke::new(1.0, LINE));
+    });
     ui.add_space(2.0);
 }
 
 fn row(ui: &mut egui::Ui, name: &str, add: impl FnOnce(&mut egui::Ui)) -> egui::Response {
     ui.horizontal(|ui| {
-        ui.allocate_ui_with_layout(vec2(170.0, 24.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
-            ui.set_min_width(170.0);
+        ui.set_min_height(30.0);
+        ui.allocate_ui_with_layout(vec2(LABEL_W, 30.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+            ui.set_min_width(LABEL_W);
             ui.label(RichText::new(name).color(MUTED));
         });
         add(ui);
     })
     .response
+}
+
+/// Texto alinhado com a coluna dos controles.
+fn note(ui: &mut egui::Ui, text: &str, color: egui::Color32) {
+    ui.horizontal(|ui| {
+        ui.add_space(LABEL_W + 8.0);
+        ui.label(RichText::new(text).color(color).size(12.5));
+    });
 }
 
 impl Settings {
@@ -162,17 +177,24 @@ impl Settings {
             }
         }
         let mut open = self.open;
+        let anim = ctx.global_style().animation_time > 0.0;
         egui::Window::new(RichText::new(t!("Ajustes", "Settings")).font(semibold(16.0)))
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
-            .default_width(640.0)
+            .default_width(700.0)
             .anchor(egui::Align2::CENTER_CENTER, vec2(0.0, 0.0))
             .show(ctx, |ui| {
+                let bg = ui.clip_rect();
+                hearts(ui.painter(), bg, if anim { ui.input(|i| i.time) } else { 0.0 });
+                if anim {
+                    ctx.request_repaint();
+                }
                 let h = (ctx.content_rect().height() - 150.0).max(300.0);
                 egui::ScrollArea::vertical().max_height(h).min_scrolled_height(h).show(ui, |ui| {
-                    ui.set_width(600.0);
-                    section(ui, t!("Dispositivos", "Devices"));
+                    ui.set_width(ui.available_width());
+                    ui.spacing_mut().item_spacing.y = 6.0;
+                    section(ui, t!("Dispositivos", "Devices"), true);
                     let d = &mut cfg.devices;
                     let mut dc = false;
                     row(ui, t!("Microfone", "Microphone"), |ui| dc |= dev_combo(ui, "dev-mic", &mut d.mic, &self.caps, true));
@@ -192,22 +214,22 @@ impl Settings {
                     cfg.app.monitor_gain_db = g;
                     let d = &mut cfg.devices;
                     row(ui, t!("Efeitos do Windows", "Windows effects"), |ui| {
-                        dc |= ui.checkbox(&mut d.mic_raw, t!("Ignorar (modo RAW)", "Skip them (RAW mode)")).changed();
+                        dc |= switch(ui, &mut d.mic_raw, t!("Ignorar (modo RAW)", "Skip them (RAW mode)"));
                     })
                     .on_hover_text(t!("Desliga realces do driver do mic, que costumam brigar com o AMA.", "Turns off the mic driver's enhancements, which tend to fight with AMA."));
                     if dc {
                         out.push(SetEdit::Devices);
                     }
 
-                    section(ui, t!("Latência", "Latency"));
+                    section(ui, t!("Latência", "Latency"), false);
                     row(ui, t!("Modo rápido", "Fast mode"), |ui| {
-                        if ui.checkbox(&mut cfg.app.low_latency, t!("Ligado", "On")).changed() {
+                        if switch(ui, &mut cfg.app.low_latency, t!("Ligado", "On")) {
                             out.push(SetEdit::LowLatency);
                         }
                     })
                     .on_hover_text(t!("DeepFilterNet sem lookahead: uns 10 ms a menos, limpa um pouco pior e usa mais CPU.", "DeepFilterNet without lookahead: about 10 ms less, slightly worse cleanup and more CPU."));
                     row(ui, t!("Saída exclusiva", "Exclusive output"), |ui| {
-                        if ui.checkbox(&mut cfg.devices.out_exclusive, t!("Ligado", "On")).changed() {
+                        if switch(ui, &mut cfg.devices.out_exclusive, t!("Ligado", "On")) {
                             out.push(SetEdit::Devices);
                         }
                     })
@@ -221,58 +243,60 @@ impl Settings {
                     })
                     .on_hover_text(t!("Quanto o VB-Cable segura antes de entregar. Menor = voz chega antes.", "How much VB-Cable holds before delivering. Lower = the voice arrives sooner."));
 
-                    section(ui, t!("Atalhos globais", "Global hotkeys"));
+                    section(ui, t!("Atalhos globais", "Global hotkeys"), false);
                     for (k, name) in [(0usize, t!("Mutar", "Mute")), (1, "Bypass")] {
                         let cur = if k == 0 { cfg.app.hotkey_mute.clone() } else { cfg.app.hotkey_bypass.clone() };
                         row(ui, name, |ui| {
                             let capturing = self.capture == Some(k);
                             let t = if capturing { t!("Pressione o atalho (Esc cancela)", "Press the hotkey (Esc cancels)").to_string() } else if cur.is_empty() { t!("Nenhum", "None").into() } else { cur.clone() };
-                            let b = egui::Button::new(RichText::new(t).monospace()).min_size(vec2(220.0, 26.0)).fill(if capturing { ACCENT_DIM } else { BG });
+                            let f = ui.ctx().animate_bool_responsive(egui::Id::unique(("hk-cap", k)), capturing);
+                            let b = egui::Button::new(RichText::new(t).monospace()).min_size(vec2(230.0, 28.0)).fill(lerp(BG, ACCENT_DIM, f)).corner_radius(7);
                             if ui.add(b).clicked() {
                                 self.capture = Some(k);
                             }
-                            if !cur.is_empty() && ui.small_button(t!("Limpar", "Clear")).clicked() {
+                            if !cur.is_empty() && ui.button(t!("Limpar", "Clear")).clicked() {
                                 if k == 0 { cfg.app.hotkey_mute.clear() } else { cfg.app.hotkey_bypass.clear() }
                                 out.push(SetEdit::Hotkeys);
                             }
                         });
                     }
                     if let Some(e) = &self.hotkey_err {
-                        ui.label(RichText::new(e).color(ERR).size(12.5));
+                        note(ui, e, ERR);
                     }
 
-                    section(ui, t!("Sistema", "System"));
+                    section(ui, t!("Sistema", "System"), false);
                     row(ui, t!("Ao ligar o PC", "On PC start"), |ui| {
-                        if ui.checkbox(&mut cfg.app.autostart, t!("Abrir o AMA na bandeja", "Open AMA in the tray")).changed() {
+                        if switch(ui, &mut cfg.app.autostart, t!("Abrir o AMA na bandeja", "Open AMA in the tray")) {
                             out.push(SetEdit::Autostart);
                         }
                     });
                     row(ui, t!("Ao fechar a janela", "When closing the window"), |ui| {
-                        for (v, t) in [("perguntar", t!("Perguntar", "Ask")), ("bandeja", t!("Ir para a bandeja", "Go to the tray")), ("sair", t!("Sair do AMA", "Quit AMA"))] {
-                            if ui.radio(cfg.app.on_close == v, t).clicked() {
-                                cfg.app.on_close = v.into();
-                                out.push(SetEdit::Saved);
-                            }
+                        let opts = [("perguntar", t!("Perguntar", "Ask")), ("bandeja", t!("Ir para a bandeja", "Go to the tray")), ("sair", t!("Sair do AMA", "Quit AMA"))];
+                        let cur = opts.iter().position(|(v, _)| cfg.app.on_close == *v).unwrap_or(0);
+                        let names: Vec<&str> = opts.iter().map(|(_, n)| *n).collect();
+                        if let Some(k) = seg(ui, &names, cur) {
+                            cfg.app.on_close = opts[k].0.into();
+                            out.push(SetEdit::Saved);
                         }
                     });
                     row(ui, t!("Idioma", "Language"), |ui| {
-                        for (v, name) in [("pt", "Português"), ("en", "English")] {
-                            if ui.radio(cfg.app.language == v, name).clicked() && cfg.app.language != v {
-                                cfg.app.language = v.into();
-                                out.push(SetEdit::Language);
-                            }
+                        let opts = [("pt", "Português"), ("en", "English")];
+                        let cur = opts.iter().position(|(v, _)| cfg.app.language == *v).unwrap_or(0);
+                        if let Some(k) = seg(ui, &["Português", "English"], cur) {
+                            cfg.app.language = opts[k].0.into();
+                            out.push(SetEdit::Language);
                         }
                     });
                     row(ui, t!("Atualizações", "Updates"), |ui| {
-                        if ui.checkbox(&mut cfg.app.check_updates, t!("Procurar ao abrir", "Check on start")).changed() {
+                        if switch(ui, &mut cfg.app.check_updates, t!("Procurar ao abrir", "Check on start")) {
                             out.push(SetEdit::Saved);
                         }
                     })
                     .on_hover_text(t!("Só instala se você aceitar.", "Only installs if you accept."));
 
-                    section(ui, t!("Presets por programa", "Per-program presets"));
+                    section(ui, t!("Presets por programa", "Per-program presets"), false);
                     row(ui, t!("Troca automática", "Auto switch"), |ui| {
-                        if ui.checkbox(&mut cfg.app.auto_preset, t!("Conforme o programa em foco", "Based on the focused program")).changed() {
+                        if switch(ui, &mut cfg.app.auto_preset, t!("Conforme o programa em foco", "Based on the focused program")) {
                             out.push(SetEdit::AutoPreset);
                         }
                     });
@@ -281,40 +305,51 @@ impl Settings {
                         out.push(SetEdit::Saved);
                     }
 
-                    section(ui, t!("Painéis", "Panels"));
+                    section(ui, t!("Aparência", "Appearance"), false);
                     let a = &mut cfg.app;
                     let mut pc = false;
-                    row(ui, t!("Mostrar", "Show"), |ui| {
-                        pc |= ui.checkbox(&mut a.show_curve, t!("Curva do EQ", "EQ curve")).changed();
-                        pc |= ui.checkbox(&mut a.show_spectrum, t!("Espectro", "Spectrum")).changed();
-                        pc |= ui.checkbox(&mut a.show_meters, t!("Medidores", "Meters")).changed();
-                        pc |= ui.checkbox(&mut a.show_status, t!("Status do motor", "Engine status")).changed();
+                    row(ui, t!("Painéis", "Panels"), |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.spacing_mut().item_spacing.x = 18.0;
+                            pc |= switch(ui, &mut a.show_curve, t!("Curva do EQ", "EQ curve"));
+                            pc |= switch(ui, &mut a.show_spectrum, t!("Espectro", "Spectrum"));
+                            pc |= switch(ui, &mut a.show_meters, t!("Medidores", "Meters"));
+                            pc |= switch(ui, &mut a.show_status, t!("Status do motor", "Engine status"));
+                        });
                     });
                     if pc {
                         out.push(SetEdit::Saved);
                     }
                     row(ui, t!("Animações", "Animations"), |ui| {
-                        if ui.checkbox(&mut cfg.app.animations, t!("Transições suaves", "Smooth transitions")).changed() {
+                        if switch(ui, &mut cfg.app.animations, t!("Transições suaves", "Smooth transitions")) {
                             out.push(SetEdit::Animations);
                         }
                     });
 
-                    section(ui, t!("Pastas de plugins VST", "VST plugin folders"));
+                    section(ui, t!("Pastas de plugins VST", "VST plugin folders"), false);
                     let mut del = None;
-                    for (k, dir) in cfg.app.vst_dirs.iter().enumerate() {
-                        ui.horizontal(|ui| {
-                            let exists = std::path::Path::new(dir).is_dir();
-                            ui.add(egui::Label::new(RichText::new(dir).color(if exists { TEXT } else { FAINT }).size(12.5)).truncate());
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui.small_button(t!("Remover", "Remove")).clicked() {
-                                    del = Some(k);
-                                }
-                                if !exists {
-                                    label_muted(ui, t!("não existe", "missing"));
-                                }
+                    egui::Frame::new().fill(BG).corner_radius(8).inner_margin(egui::Margin::symmetric(10, 6)).show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        for (k, dir) in cfg.app.vst_dirs.iter().enumerate() {
+                            ui.horizontal(|ui| {
+                                let exists = std::path::Path::new(dir).is_dir();
+                                let (r, _) = ui.allocate_exact_size(vec2(8.0, 18.0), egui::Sense::hover());
+                                ui.painter().circle_filled(r.center(), 3.0, if exists { OK } else { FAINT });
+                                ui.add(egui::Label::new(RichText::new(dir).color(if exists { TEXT } else { FAINT }).size(12.5)).truncate());
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    if ui.small_button(t!("Remover", "Remove")).clicked() {
+                                        del = Some(k);
+                                    }
+                                    if !exists {
+                                        label_muted(ui, t!("não existe", "missing"));
+                                    }
+                                });
                             });
-                        });
-                    }
+                        }
+                        if cfg.app.vst_dirs.is_empty() {
+                            label_muted(ui, t!("Nenhuma pasta.", "No folders."));
+                        }
+                    });
                     if let Some(k) = del {
                         cfg.app.vst_dirs.remove(k);
                         out.push(SetEdit::VstDirs);
@@ -326,24 +361,29 @@ impl Settings {
                         }
                     }
 
-                    section(ui, t!("Primeiros passos", "Getting started"));
+                    section(ui, t!("Primeiros passos", "Getting started"), false);
                     row(ui, t!("Assistente", "Assistant"), |ui| {
                         if ui.button(t!("Abrir", "Open")).on_hover_text(t!("Confere o VB-Cable e o mic, e mede o ruído do ambiente.", "Checks VB-Cable and the mic, and measures room noise.")).clicked() {
                             out.push(SetEdit::Wizard);
                         }
                     });
 
-                    section(ui, t!("Sobre", "About"));
-                    label_muted(ui, t!("AMA (Another Mic App). Filtros, GraphicEQ, Loudness correction, convolução e host VST portados do Equalizer APO (GPL-2.0).", "AMA (Another Mic App). Filters, GraphicEQ, Loudness correction, convolution and VST host ported from Equalizer APO (GPL-2.0)."));
-                    label_muted(ui, t!("Cancelamento de eco: WebRTC AEC3. Redução de ruído: DeepFilterNet 3.", "Echo cancellation: WebRTC AEC3. Noise reduction: DeepFilterNet 3."));
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new(t!("Feito por", "Made by")).color(MUTED));
-                        ui.label(RichText::new("@ruptvra").font(semibold(14.0)).color(ACCENT));
-                        ui.add_space(8.0);
-                        ui.hyperlink_to("Buy me a coffee", "https://buymeacoffee.com/ruptvra");
+                    section(ui, t!("Sobre", "About"), false);
+                    egui::Frame::new().fill(BG).corner_radius(8).inner_margin(egui::Margin::symmetric(12, 10)).show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        label_muted(ui, t!("AMA (Another Mic App). Filtros, GraphicEQ, Loudness correction, convolução e host VST portados do Equalizer APO (GPL-2.0).", "AMA (Another Mic App). Filters, GraphicEQ, Loudness correction, convolution and VST host ported from Equalizer APO (GPL-2.0)."));
+                        label_muted(ui, t!("Cancelamento de eco: WebRTC AEC3. Redução de ruído: DeepFilterNet 3.", "Echo cancellation: WebRTC AEC3. Noise reduction: DeepFilterNet 3."));
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(t!("Feito por", "Made by")).color(MUTED));
+                            ui.label(RichText::new("@ruptvra").font(semibold(14.0)).color(ACCENT));
+                            let (r, _) = ui.allocate_exact_size(vec2(14.0, 18.0), egui::Sense::hover());
+                            ui.painter().add(heart(r.center(), 12.0, 0.0, egui::Stroke::new(1.4, ACCENT)));
+                            ui.add_space(8.0);
+                            ui.hyperlink_to("Buy me a coffee", "https://buymeacoffee.com/ruptvra");
+                        });
                     });
-                    ui.add_space(4.0);
+                    ui.add_space(6.0);
                 });
             });
         if !open {

@@ -1,5 +1,6 @@
 #[macro_use]
 pub mod i18n;
+pub mod anim;
 pub mod cable;
 pub mod cards;
 pub mod graph;
@@ -105,6 +106,7 @@ pub struct AmaApp {
     spec_tmp: Vec<f32>,
     m_in: Meter,
     m_out: Meter,
+    pop: anim::PopAnim,
     settings: Settings,
     sys: Sys,
     hwnd: isize,
@@ -162,6 +164,7 @@ impl AmaApp {
             spec_tmp: vec![0.0; micclean::engine::SPEC_RING],
             m_in: Meter::new(),
             m_out: Meter::new(),
+            pop: Default::default(),
             settings: Settings::default(),
             sys,
             hwnd,
@@ -1260,6 +1263,7 @@ impl eframe::App for AmaApp {
         self.settings_window(&ctx);
         self.dialogs(&ctx);
         self.wizard_window(&ctx);
+        self.pop.run(&ctx);
         ctx.request_repaint_after(std::time::Duration::from_millis(33));
     }
 
