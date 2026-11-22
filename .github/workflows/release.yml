@@ -22,12 +22,13 @@ jobs:
         with:
           workspaces: micclean
 
-      - name: Check version
+      - name: Set version from tag
         shell: pwsh
         run: |
           $tag = "${{ github.ref_name }}".TrimStart("v")
-          $ver = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
-          if ($tag -ne $ver) { throw "tag $tag does not match Cargo.toml version $ver" }
+          $toml = Get-Content Cargo.toml -Raw
+          $toml = [regex]::Replace($toml, '(?m)^version = ".+"', "version = `"$tag`"", 1)
+          Set-Content Cargo.toml $toml -NoNewline
 
       - name: Test
         run: cargo test --release --lib
