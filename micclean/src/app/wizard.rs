@@ -43,7 +43,7 @@ fn primary(ui: &mut egui::Ui, t: &str) -> bool {
 
 impl Wizard {
     fn scan(&mut self, current_mic: &str) {
-        self.cable = audio::list(Direction::Render).unwrap_or_default().into_iter().find(|d| d.name.to_lowercase().contains("cable input")).map(|d| d.name);
+        self.cable = audio::list(Direction::Render).unwrap_or_default().into_iter().find(|d| audio::is_cable_input(&d.name)).map(|d| d.name);
         self.mics = audio::list(Direction::Capture).unwrap_or_default().into_iter().filter(|d| !d.name.to_lowercase().contains("cable output")).collect();
         if self.mic.is_empty() {
             let m = current_mic.to_lowercase();

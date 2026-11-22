@@ -35,7 +35,7 @@ fn dev_combo(ui: &mut egui::Ui, id: &str, cur: &mut String, list: &[DevInfo], al
     let shown = if cur.is_empty() {
         t!("Padrão do Windows", "Windows default").to_string()
     } else {
-        list.iter().find(|d| d.name.to_lowercase().contains(&cur.to_lowercase())).map(|d| d.name.clone()).unwrap_or_else(|| tr!("{cur} (não encontrado)", "{cur} (not found)"))
+        list.iter().find(|d| audio::name_matches(&d.name, cur)).map(|d| d.name.clone()).unwrap_or_else(|| tr!("{cur} (não encontrado)", "{cur} (not found)"))
     };
     egui::ComboBox::from_id_salt(id).selected_text(shown).width(ui.available_width().min(420.0)).show_ui(ui, |ui| {
         if allow_default && ui.selectable_label(cur.is_empty(), t!("Padrão do Windows", "Windows default")).clicked() {
@@ -43,7 +43,7 @@ fn dev_combo(ui: &mut egui::Ui, id: &str, cur: &mut String, list: &[DevInfo], al
             c = true;
         }
         for d in list {
-            let on = !cur.is_empty() && d.name.to_lowercase().contains(&cur.to_lowercase());
+            let on = audio::name_matches(&d.name, cur);
             let label = if d.is_default { tr!("{}  (padrão)", "{}  (default)", d.name) } else { d.name.clone() };
             if ui.selectable_label(on, label).clicked() {
                 *cur = d.name.clone();
@@ -207,7 +207,7 @@ impl Settings {
                             out.push(SetEdit::Devices);
                         }
                     })
-                    .on_hover_text(t!("O AMA escreve no cabo sem passar pelo mixer do Windows: uns 10 a 15 ms a menos. Nenhum outro programa consegue tocar no CABLE Input enquanto estiver ligado.", "AMA writes to the cable without the Windows mixer: about 10 to 15 ms less. No other program can play into CABLE Input while it is on."));
+                    .on_hover_text(t!("O AMA escreve no cabo sem passar pelo mixer do Windows: uns 10 a 15 ms a menos. Nenhum outro programa consegue tocar no CABLE Input enquanto estiver ligado. Experimental: no VB-Cable 3.5 o atraso às vezes vai crescendo.", "AMA writes to the cable without the Windows mixer: about 10 to 15 ms less. No other program can play into CABLE Input while it is on. Experimental: on VB-Cable 3.5 the delay sometimes keeps growing."));
                     row(ui, t!("Buffer do VB-Cable", "VB-Cable buffer"), |ui| {
                         ui.vertical(|ui| {
                             if !self.lat.show(ui) {

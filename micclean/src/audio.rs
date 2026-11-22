@@ -47,7 +47,28 @@ pub fn find(dir: Direction, pattern: &str) -> Res<Device> {
             return Ok(d);
         }
     }
+    // o Windows às vezes dá outro nome à entrada do VB-Cable, como "Alto-falantes (VB-Audio Virtual Cable)"
+    if dir == Direction::Render && p.contains("cable input") {
+        for i in 0..col.get_nbr_devices().map_err(e)? {
+            let d = col.get_device_at_index(i).map_err(e)?;
+            if is_cable_input(&d.get_friendlyname().unwrap_or_default()) {
+                return Ok(d);
+            }
+        }
+    }
     Err(format!("dispositivo não encontrado: '{pattern}' ({dir:?})"))
+}
+
+/// Nome bate com o padrão salvo na config, aceitando o VB-Cable renomeado.
+pub fn name_matches(name: &str, pattern: &str) -> bool {
+    let p = pattern.to_lowercase();
+    !p.is_empty() && (name.to_lowercase().contains(&p) || (p.contains("cable input") && is_cable_input(name)))
+}
+
+/// Entrada principal do VB-Cable, qualquer que seja o nome do endpoint.
+pub fn is_cable_input(name: &str) -> bool {
+    let n = name.to_lowercase();
+    n.contains("cable input") || (n.contains("vb-audio virtual cable") && !n.contains("16 ch") && !n.contains("cable output"))
 }
 
 pub fn default_id(dir: Direction) -> Option<String> {
