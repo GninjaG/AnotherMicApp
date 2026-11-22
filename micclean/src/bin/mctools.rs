@@ -202,6 +202,7 @@ fn base_cfg(out: &str) -> Config {
     c.devices.output = out.into();
     c.devices.speakers = "Speaker Out".into();
     c.app.low_latency = std::env::var("AMA_LL").is_ok();
+    c.devices.out_exclusive = std::env::var("AMA_EXCL").is_ok();
     c
 }
 
@@ -475,7 +476,8 @@ fn cmd_longtest(out: &str, minutes: f64, play: bool) {
 }
 
 /// Atraso só do VB-Cable: clique escrito no CABLE Input até chegar a quem lê o CABLE Output (relógio Instant).
-fn cmd_cable(buf_ms: f64) {
+fn cmd_cable(buf_ms: f64, rmode: &str, cmode: &str) {
+    let excl_read = cmode == "excl";
     let t0 = Instant::now();
     let stop = Arc::new(AtomicBool::new(false));
     let st = stop.clone();
@@ -483,7 +485,7 @@ fn cmd_cable(buf_ms: f64) {
         audio::com_init();
         let _mm = audio::mmcss_pro_audio();
         let dev = audio::find(Direction::Capture, "CABLE Output")?;
-        let mut c = audio::open_capture(&dev, false, false, 1)?;
+        let mut c = if excl_read { audio::open_capture_exclusive(&dev, 2)? } else { audio::open_capture(&dev, false, false, 1)? };
         c.client.start_stream().map_err(|e| e.to_string())?;
         let mut ev = vec![];
         let mut last = -1.0f64;
@@ -511,7 +513,11 @@ fn cmd_cable(buf_ms: f64) {
         audio::com_init();
         let _mm = audio::mmcss_pro_audio();
         let dev = audio::find(Direction::Render, "CABLE Input")?;
-        let mut r = audio::open_render(&dev, 2, Some(hns))?;
+        let mut r = match rmode {
+            "fast" => audio::open_render_fast(&dev)?,
+            "excl" => audio::open_render_exclusive(&dev, 2)?,
+            _ => audio::open_render(&dev, 2, Some(hns))?,
+        };
         let bf = r.buffer_frames as usize;
         r.client.start_stream().map_err(|e| e.to_string())?;
         let mut pos = 0usize;
@@ -542,7 +548,7 @@ fn cmd_cable(buf_ms: f64) {
     }
     let got = got.unwrap_or_default();
     let d: Vec<String> = played.iter().filter_map(|&t| got.iter().find(|&&u| u > t - 0.05 && u < t + 0.9).map(|u| format!("{:.1}", (u - t) * 1000.0))).collect();
-    println!("  render {buf_ms} ms: cliques {} enviados, {} recebidos | atraso até o leitor (ms): {}", played.len(), got.len(), d.join(" "));
+    println!("  render {rmode} {buf_ms} ms, leitura {cmode}: cliques {} enviados, {} recebidos | atraso até o leitor (ms): {}", played.len(), got.len(), d.join(" "));
 }
 
 /// Roda o app com AEC e DFN por `secs` e mostra as últimas estatísticas (falhas de buffer).
@@ -581,7 +587,7 @@ fn main() {
         Some("e2e") => cmd_e2e(&arg(2, out_default), arg(3, "20").parse().unwrap()),
         Some("soak") => cmd_soak(&arg(2, out_default), arg(3, "60").parse().unwrap_or(60)),
         Some("periods") => cmd_periods(),
-        Some("cable") => cmd_cable(arg(2, "10").parse().unwrap_or(10.0)),
+        Some("cable") => cmd_cable(arg(2, "10").parse().unwrap_or(10.0), &arg(3, "shared"), &arg(4, "shared")),
         Some("latency") => cmd_latency(&arg(2, out_default), &arg(3, ""), &arg(4, "")),
         Some("talk") => cmd_talk(&arg(2, "CABLE Input")),
         Some("longtest") => cmd_longtest(&arg(2, out_default), arg(3, "30").parse().unwrap(), arg(4, "play") == "play"),

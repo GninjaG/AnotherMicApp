@@ -20,6 +20,8 @@ pub struct Devices {
     pub speakers: String,
     pub output: String,
     pub mic_raw: bool,
+    /// Saída em modo exclusivo (sem o mixer do Windows). Nenhum outro programa toca nela.
+    pub out_exclusive: bool,
     /// Escuta do mic (vazio = reprodução padrão).
     pub monitor: String,
 }
@@ -125,6 +127,7 @@ impl Default for Devices {
             speakers: "".into(),
             output: "CABLE Input".into(),
             mic_raw: true,
+            out_exclusive: false,
             monitor: "".into(),
         }
     }

@@ -202,6 +202,12 @@ impl Settings {
                         }
                     })
                     .on_hover_text(t!("DeepFilterNet sem lookahead: uns 10 ms a menos, limpa um pouco pior e usa mais CPU.", "DeepFilterNet without lookahead: about 10 ms less, slightly worse cleanup and more CPU."));
+                    row(ui, t!("Saída exclusiva", "Exclusive output"), |ui| {
+                        if ui.checkbox(&mut cfg.devices.out_exclusive, t!("Ligado", "On")).changed() {
+                            out.push(SetEdit::Devices);
+                        }
+                    })
+                    .on_hover_text(t!("O AMA escreve no cabo sem passar pelo mixer do Windows: uns 10 a 15 ms a menos. Nenhum outro programa consegue tocar no CABLE Input enquanto estiver ligado.", "AMA writes to the cable without the Windows mixer: about 10 to 15 ms less. No other program can play into CABLE Input while it is on."));
                     row(ui, t!("Buffer do VB-Cable", "VB-Cable buffer"), |ui| {
                         ui.vertical(|ui| {
                             if !self.lat.show(ui) {

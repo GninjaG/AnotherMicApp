@@ -468,7 +468,13 @@ fn out_thread(devs: Arc<DevState>, mut cons: Consumer<f32>, out_ms: f64, st: Arc
             let mut h = audio::hotplug();
             let dev = audio::find(Direction::Render, name)?;
             let id = dev.get_id().map_err(|e| e.to_string())?;
-            let mut r = match audio::open_render_fast(&dev) {
+            let excl = if !monitor && d.out_exclusive {
+                audio::open_render_exclusive(&dev, 2).map_err(|e| log!("{tag}: {e}, usando o modo compartilhado")).ok()
+            } else {
+                None
+            };
+            let exclusive = excl.is_some();
+            let mut r = match excl.map(Ok).unwrap_or_else(|| audio::open_render_fast(&dev)) {
                 Ok(r) => r,
                 Err(e) => {
                     log!("{tag}: {e}, usando o período padrão");
@@ -511,7 +517,7 @@ fn out_thread(devs: Arc<DevState>, mut cons: Consumer<f32>, out_ms: f64, st: Arc
                     reader.set_target(target(ll));
                 }
                 let avail = r.available()?;
-                if avail >= bf && !monitor && warm > 50 {
+                if avail >= bf && !monitor && !exclusive && warm > 50 {
                     inc(&st.out_starves);
                 }
                 warm += 1;
