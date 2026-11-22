@@ -6,6 +6,8 @@ Made by [@ruptvra](https://buymeacoffee.com/ruptvra).
 
 <a href="https://buymeacoffee.com/ruptvra"><img src="https://img.buymeacoffee.com/button-api/?text=Buy%20me%20a%20coffee&emoji=%E2%98%95&slug=ruptvra&button_colour=e24a76&font_colour=ffffff&font_family=Inter&outline_colour=ffffff&coffee_colour=FFDD00" alt="Buy me a coffee" height="44"></a>
 
+![AMA](docs/screenshot.png)
+
 ## English
 
 AMA cleans up your microphone on Windows and sends the result to a virtual cable (VB-Cable), so Discord or any other app gets the processed voice.
