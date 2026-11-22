@@ -203,6 +203,9 @@ fn base_cfg(out: &str) -> Config {
     c.devices.speakers = "Speaker Out".into();
     c.app.low_latency = std::env::var("AMA_LL").is_ok();
     c.devices.out_exclusive = std::env::var("AMA_EXCL").is_ok();
+    if let Some(v) = std::env::var("AMA_OUTMS").ok().and_then(|s| s.parse().ok()) {
+        c.buffers.out_ms = v;
+    }
     c
 }
 
@@ -310,7 +313,8 @@ fn cmd_latency(out: &str, mic: &str, play_dev: &str) {
     }
     let near = testdata("near_en.wav");
     let speech: Vec<f32> = (0..10 * SR).map(|i| near[(i + SR) % near.len()]).collect();
-    for (name, dfn, sig) in [("lat_click_sem_dfn", false, &click), ("lat_voz_com_dfn", true, &speech)] {
+    let runs = if std::env::var("AMA_CLICKONLY").is_ok() { 1 } else { 2 };
+    for (name, dfn, sig) in [("lat_click_sem_dfn", false, &click), ("lat_voz_com_dfn", true, &speech)].into_iter().take(runs) {
         let mut cfg = base_cfg(out);
         if !mic.is_empty() {
             cfg.devices.mic = mic.into();

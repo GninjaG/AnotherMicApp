@@ -50,15 +50,16 @@ pub struct Output {
     pub limiter: bool,
 }
 
-pub const OUT_MS: f64 = 6.0;
+pub const OUT_MS: f64 = 3.0;
 /// Alvo do buffer de saída. No modo de baixa latência o DFN tem picos maiores, então leva mais folga.
 pub fn out_target_ms(out_ms: f64, low_latency: bool) -> f64 {
     if low_latency { out_ms + 4.0 } else { out_ms }
 }
 
-/// Alvo do buffer de saída para um render com `period` frames: nunca menos que 2 períodos.
+/// Alvo do buffer de saída para um render com `period` frames: nunca menos que 1 período.
+/// O alvo vale para o ponto mais baixo do buffer, logo antes de chegar o próximo bloco de 10 ms.
 pub fn out_target_for(out_ms: f64, low_latency: bool, period: u32) -> f64 {
-    out_target_ms(out_ms, low_latency).max(2.0 * period as f64 * 1000.0 / crate::SR as f64)
+    out_target_ms(out_ms, low_latency).max(period as f64 * 1000.0 / crate::SR as f64)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -215,7 +216,7 @@ gain_db = 0.0
 limiter = true
 
 [buffers]
-out_ms = 6.0
+out_ms = 3.0
 ref_ms = 25.0
 
 [app]
@@ -240,8 +241,8 @@ impl Config {
         let s = std::fs::read_to_string(path).map_err(|e| format!("{path:?}: {e}"))?;
         let mut c: Config = toml::from_str(&s).map_err(|e| format!("{path:?}: {e}"))?;
         c.app.setup_pending |= new;
-        // 20 ms era o padrão antigo: com o render rápido não precisa mais
-        if c.buffers.out_ms == 20.0 {
+        // 20 e 6 ms eram padrões antigos
+        if c.buffers.out_ms == 20.0 || c.buffers.out_ms == 6.0 {
             c.buffers.out_ms = OUT_MS;
         }
         Ok(c)
