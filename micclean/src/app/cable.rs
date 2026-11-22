@@ -50,20 +50,39 @@ fn note(s: &str) {
     }
 }
 
-fn restart_device() -> i32 {
-    let Some(id) = read_sz(w!(r"SYSTEM\CurrentControlSet\Services\VBAudioVACMME\Enum"), w!("0")) else {
+fn instance() -> Option<String> {
+    let id = read_sz(w!(r"SYSTEM\CurrentControlSet\Services\VBAudioVACMME\Enum"), w!("0"));
+    if id.is_none() {
         note("instância do VB-Cable não encontrada");
-        return 2;
-    };
-    let r = run("pnputil", &["/restart-device", &id]);
-    note(&format!("pnputil /restart-device {id}: {r:?}"));
-    if r == Ok(0) { 0 } else { 2 }
+    }
+    id
 }
 
-/// Para o áudio do Windows (que segura o driver), reinicia o VB-Cable e liga de novo.
+fn pnp(verb: &str, id: &str) -> Result<i32, String> {
+    let r = run("pnputil", &[verb, id]);
+    note(&format!("pnputil {verb} {id}: {r:?}"));
+    r
+}
+
+fn restart_device() -> i32 {
+    let Some(id) = instance() else { return 2 };
+    if pnp("/restart-device", &id) == Ok(0) { 0 } else { 2 }
+}
+
+/// O VB-Cable não aceita /restart-device; desativar e reativar faz o driver recarregar.
+fn cycle_device() -> i32 {
+    let Some(id) = instance() else { return 2 };
+    let off = pnp("/disable-device", &id);
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    // reativa sempre, para nunca deixar o cabo desligado
+    let on = pnp("/enable-device", &id);
+    if off == Ok(0) && on == Ok(0) { 0 } else { 2 }
+}
+
+/// Para o áudio do Windows (que segura o driver), recarrega o VB-Cable e liga de novo.
 fn force_restart() -> i32 {
     note(&format!("parar AudioEndpointBuilder: {:?}", run("net", &["stop", "AudioEndpointBuilder", "/y"])));
-    let r = restart_device();
+    let r = cycle_device();
     for svc in ["AudioEndpointBuilder", "Audiosrv"] {
         note(&format!("iniciar {svc}: {:?}", run("net", &["start", svc])));
     }
