@@ -551,7 +551,7 @@ fn cmd_soak(out: &str, secs: u64) {
     let app = start_app("soak", &mut cfg);
     std::thread::sleep(Duration::from_secs(secs));
     let log = app.stop();
-    for l in log.lines().filter(|l| l.contains("stats:")).last() {
+    if let Some(l) = log.lines().rfind(|l| l.contains("stats:")) {
         println!("  {}", l.split("stats: ").nth(1).unwrap_or(l));
     }
 }

@@ -3,6 +3,7 @@ use super::theme::*;
 use egui::{Color32, Rect, RichText, Sense, Stroke, pos2, vec2};
 use micclean::fx::biquad::{BqParams, BqType, Width};
 use micclean::fx::chain::{BlockCfg, GeqMode, Kind};
+use micclean::fx::dynamics::CompParams;
 use micclean::fx::geq;
 use micclean::fx::vst::VstPlugin;
 use std::collections::{BTreeMap, BTreeSet};
@@ -34,6 +35,7 @@ pub struct Ctx<'a> {
     pub vst: &'a BTreeMap<u32, Arc<VstPlugin>>,
     pub sel: Option<u32>,
     pub vol_db: f64,
+    pub meters: &'a BTreeMap<u32, f32>,
 }
 
 pub fn subtitle(b: &BlockCfg, vst: &BTreeMap<u32, Arc<VstPlugin>>) -> String {
@@ -56,6 +58,8 @@ pub fn subtitle(b: &BlockCfg, vst: &BTreeMap<u32, Arc<VstPlugin>>) -> String {
         }
         Kind::Delay { ms } => format!("{ms:.1} ms"),
         Kind::Limiter { ceiling_db, release_ms } => tr!("teto {ceiling_db:.1} dB, release {release_ms:.0} ms", "ceiling {ceiling_db:.1} dB, release {release_ms:.0} ms"),
+        Kind::Compressor { p } => tr!("{:.0} dB, {:.1}:1, make-up {:+.1} dB", "{:.0} dB, {:.1}:1, make-up {:+.1} dB", p.threshold_db, p.ratio, p.total_makeup()),
+        Kind::DeEsser { p } => tr!("acima de {}, limiar {:.0} dB", "above {}, threshold {:.0} dB", hz(p.freq_hz), p.threshold_db),
         Kind::Vst { library, .. } => vst.get(&b.id).map(|p| p.name.clone()).filter(|n| !n.is_empty()).unwrap_or_else(|| file_stem(library)),
     }
 }
@@ -152,6 +156,11 @@ impl Cards {
                             }
                         }
                         let ch = chevron(ui, open);
+                        if let Some(&d) = cx.meters.get(&id).filter(|d| d.is_finite() && b.enabled) {
+                            let c = if d.abs() < 0.5 { FAINT } else if d > 3.0 { WARN } else { MUTED };
+                            ui.label(RichText::new(format!("{d:+.1} dB")).monospace().size(11.5).color(c))
+                                .on_hover_text(t!("Quanto este bloco muda o nível agora", "How much this block changes the level right now"));
+                        }
                         let rest = ui.available_rect_before_wrap();
                         let area = ui.interact(rest, ui.scope_id().with(("head", id)), Sense::click());
                         ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
@@ -301,6 +310,27 @@ fn editor(ui: &mut egui::Ui, b: &mut BlockCfg, cx: &Ctx) -> Option<Edit> {
         Kind::Limiter { ceiling_db, release_ms } => {
             let mut c = param(ui, t!("Teto", "Ceiling"), ceiling_db, -24.0..=0.0, " dB", false, 1);
             c |= param(ui, "Release", release_ms, 5.0..=1000.0, " ms", true, 0);
+            live(c)
+        }
+        Kind::Compressor { p } => {
+            label_muted(ui, t!("Deixa a voz mais constante: abaixa o que passa do limiar e o make-up devolve o volume.", "Evens out the voice: turns down what goes over the threshold and the make-up gain brings the level back."));
+            let mut c = param(ui, t!("Limiar", "Threshold"), &mut p.threshold_db, -60.0..=0.0, " dB", false, 1);
+            c |= param(ui, "Ratio", &mut p.ratio, 1.0..=20.0, ":1", true, 1);
+            c |= param(ui, "Attack", &mut p.attack_ms, 0.1..=100.0, " ms", true, 1);
+            c |= param(ui, "Release", &mut p.release_ms, 10.0..=1000.0, " ms", true, 0);
+            c |= param(ui, "Knee", &mut p.knee_db, 0.0..=24.0, " dB", false, 1);
+            c |= param(ui, "Make-up", &mut p.makeup_db, -12.0..=24.0, " dB", false, 1);
+            let auto = CompParams { auto_makeup: true, ..*p }.total_makeup() - p.makeup_db;
+            c |= ui.checkbox(&mut p.auto_makeup, RichText::new(tr!("Make-up automático (+{:.1} dB)", "Auto make-up (+{:.1} dB)", auto)).size(12.5).color(MUTED)).changed();
+            live(c)
+        }
+        Kind::DeEsser { p } => {
+            label_muted(ui, t!("Abaixa o chiado do S e do X. Ouça a escuta e desça o limiar até o S suavizar.", "Tames harsh S and X sounds. Listen on the monitor and lower the threshold until the S softens."));
+            let mut c = param(ui, t!("Frequência", "Frequency"), &mut p.freq_hz, 2000.0..=12000.0, " Hz", true, 0);
+            c |= param(ui, t!("Limiar", "Threshold"), &mut p.threshold_db, -60.0..=0.0, " dB", false, 1);
+            c |= param(ui, "Ratio", &mut p.ratio, 1.0..=20.0, ":1", true, 1);
+            c |= param(ui, t!("Redução máxima", "Max reduction"), &mut p.range_db, 0.0..=24.0, " dB", false, 1);
+            c |= ui.checkbox(&mut p.split, RichText::new(t!("Só nos agudos (split)", "Highs only (split)")).size(12.5).color(MUTED)).changed();
             live(c)
         }
         Kind::Vst { library, .. } => {
@@ -522,6 +552,8 @@ pub fn new_kind(k: usize) -> Kind {
         5 => Kind::Delay { ms: 0.0 },
         6 => Kind::Limiter { ceiling_db: -1.5, release_ms: 50.0 },
         7 => Kind::Aec { tuning: "equilibrado".into() },
+        9 => Kind::Compressor { p: Default::default() },
+        10 => Kind::DeEsser { p: Default::default() },
         _ => Kind::Denoise { atten_db: 100.0, post_filter: 0.0 },
     }
 }
@@ -536,11 +568,13 @@ pub fn new_name(k: usize) -> &'static str {
         5 => "Delay",
         6 => t!("Limitador", "Limiter"),
         7 => t!("Cancelamento de eco (AEC)", "Echo cancellation (AEC)"),
+        9 => "Compressor",
+        10 => "De-esser",
         _ => t!("Redução de ruído (DeepFilterNet)", "Noise reduction (DeepFilterNet)"),
     }
 }
 
-pub const NEW_COUNT: usize = 9;
+pub const NEW_COUNT: usize = 11;
 
 pub fn title(k: &Kind) -> &'static str {
     match k {
@@ -553,6 +587,8 @@ pub fn title(k: &Kind) -> &'static str {
         Kind::Limiter { .. } => new_name(6),
         Kind::Aec { .. } => new_name(7),
         Kind::Denoise { .. } => new_name(8),
+        Kind::Compressor { .. } => new_name(9),
+        Kind::DeEsser { .. } => new_name(10),
         Kind::Vst { .. } => t!("Plugin VST", "VST plugin"),
     }
 }

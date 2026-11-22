@@ -241,6 +241,8 @@ pub fn export(blocks: &[BlockCfg], base: &Path) -> String {
             Kind::Aec { .. } => "# AMA: cancelamento de eco (sem equivalente no Equalizer APO)".to_string(),
             Kind::Denoise { atten_db, .. } => format!("# AMA: DeepFilterNet, limite {atten_db} dB (sem equivalente no Equalizer APO)"),
             Kind::Limiter { ceiling_db, release_ms } => format!("# AMA: limitador {ceiling_db} dB, release {release_ms} ms (sem equivalente no Equalizer APO)"),
+            Kind::Compressor { p } => format!("# AMA: compressor {} dB, {}:1, make-up {:.1} dB (sem equivalente no Equalizer APO)", p.threshold_db, p.ratio, p.total_makeup()),
+            Kind::DeEsser { p } => format!("# AMA: de-esser {} Hz, {} dB (sem equivalente no Equalizer APO)", p.freq_hz, p.threshold_db),
             Kind::Preamp { gain_db } => format!("{pre}Preamp: {gain_db} dB"),
             Kind::Filter { p } => format!("{pre}Filter: {}", fmt_filter(p)),
             Kind::GraphicEq { nodes, .. } => {

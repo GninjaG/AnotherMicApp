@@ -28,7 +28,8 @@ fn simulate(minutes: f64, out_ppm: f64, ref_ppm: f64, seed: u64) -> SimResult {
     let (mut oprod, mut ocons) = RingBuffer::<f32>::new(ring);
     let (mut rprod, mut rcons) = RingBuffer::<f32>::new(ring);
     let b = micclean::config::Buffers::default();
-    let mut outp = OutPath::new(b.out_ms, ring);
+    // render de 10 ms (caminho sem IAudioClient3): o motor usa no mínimo 2 períodos
+    let mut outp = OutPath::new(micclean::config::out_target_for(b.out_ms, false, FRAME as u32), ring);
     let mut refp = RefPath::new(b.ref_ms);
     let mut reader = OutReader::new(outp.target);
     let mut rng = Lcg(seed);

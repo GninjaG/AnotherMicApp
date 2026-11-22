@@ -12,6 +12,7 @@ pub struct Settings {
     loaded: bool,
     capture: Option<usize>,
     seen: u64,
+    programs: Vec<String>,
     pub hotkey_err: Option<String>,
 }
 
@@ -23,6 +24,8 @@ pub enum SetEdit {
     VstDirs,
     Language,
     LowLatency,
+    AutoPreset,
+    Wizard,
     Saved,
 }
 
@@ -67,6 +70,58 @@ fn row(ui: &mut egui::Ui, name: &str, add: impl FnOnce(&mut egui::Ui)) {
 }
 
 impl Settings {
+    fn program_rules(&mut self, ui: &mut egui::Ui, cfg: &mut Config, presets: &[String]) -> bool {
+        let mut c = false;
+        label_muted(ui, t!("Ao sair do programa, volta para o preset que você escolheu.", "When you leave the program, it goes back to the preset you picked."));
+        let mut del = None;
+        for (k, r) in cfg.app.program_presets.iter_mut().enumerate() {
+            ui.horizontal(|ui| {
+                c |= ui.add(egui::TextEdit::singleline(&mut r.exe).desired_width(200.0).hint_text("jogo.exe")).changed();
+                ui.label(RichText::new("\u{2192}").color(MUTED));
+                let shown = if r.preset.is_empty() { t!("Escolha o preset", "Pick a preset").to_string() } else { r.preset.clone() };
+                egui::ComboBox::from_id_salt(("prog-preset", k)).selected_text(shown).width(200.0).show_ui(ui, |ui| {
+                    for n in presets {
+                        if ui.selectable_label(r.preset == *n, n).clicked() {
+                            r.preset = n.clone();
+                            c = true;
+                        }
+                    }
+                });
+                if !r.preset.is_empty() && !presets.contains(&r.preset) {
+                    label_muted(ui, t!("preset não existe", "preset missing"));
+                }
+                if ui.small_button(t!("Remover", "Remove")).clicked() {
+                    del = Some(k);
+                }
+            });
+        }
+        if let Some(k) = del {
+            cfg.app.program_presets.remove(k);
+            c = true;
+        }
+        let r = egui::ComboBox::from_id_salt("prog-add").selected_text(t!("Adicionar programa aberto", "Add an open program")).width(260.0).show_ui(ui, |ui| {
+            let mut pick = None;
+            for p in &self.programs {
+                if ui.selectable_label(false, p).clicked() {
+                    pick = Some(p.clone());
+                }
+            }
+            if self.programs.is_empty() {
+                label_muted(ui, t!("Nenhum programa com janela aberta", "No program with an open window"));
+            }
+            pick
+        });
+        if r.response.clicked() {
+            self.programs = super::sys::window_programs();
+        }
+        if let Some(Some(exe)) = r.inner {
+            let preset = presets.first().cloned().unwrap_or_default();
+            cfg.app.program_presets.push(micclean::config::ProgramPreset { exe, preset });
+            c = true;
+        }
+        c
+    }
+
     fn refresh(&mut self) {
         self.caps = audio::list(Direction::Capture).unwrap_or_default();
         self.rends = audio::list(Direction::Render).unwrap_or_default();
@@ -74,7 +129,7 @@ impl Settings {
         self.seen = audio::hotplug();
     }
 
-    pub fn show(&mut self, ctx: &egui::Context, cfg: &mut Config) -> Vec<SetEdit> {
+    pub fn show(&mut self, ctx: &egui::Context, cfg: &mut Config, presets: &[String]) -> Vec<SetEdit> {
         let mut out = vec![];
         if !self.open {
             self.capture = None;
@@ -188,6 +243,16 @@ impl Settings {
                         }
                     });
 
+                    section(ui, t!("Presets por programa", "Per-program presets"));
+                    row(ui, "", |ui| {
+                        if ui.checkbox(&mut cfg.app.auto_preset, t!("Trocar o preset conforme o programa em foco", "Switch the preset based on the focused program")).changed() {
+                            out.push(SetEdit::AutoPreset);
+                        }
+                    });
+                    if cfg.app.auto_preset && self.program_rules(ui, cfg, presets) {
+                        out.push(SetEdit::Saved);
+                    }
+
                     section(ui, t!("Painéis", "Panels"));
                     let a = &mut cfg.app;
                     let mut pc = false;
@@ -227,6 +292,14 @@ impl Settings {
                             out.push(SetEdit::VstDirs);
                         }
                     }
+
+                    section(ui, t!("Primeiros passos", "Getting started"));
+                    row(ui, "", |ui| {
+                        if ui.button(t!("Abrir o assistente", "Open the assistant")).clicked() {
+                            out.push(SetEdit::Wizard);
+                        }
+                        label_muted(ui, t!("Confere o VB-Cable, o mic e mede o ruído do ambiente.", "Checks VB-Cable and the mic, and measures room noise."));
+                    });
 
                     section(ui, t!("Sobre", "About"));
                     label_muted(ui, t!("AMA (Another Mic App). Filtros, GraphicEQ, Loudness correction, convolução e host VST portados do Equalizer APO (GPL-2.0).", "AMA (Another Mic App). Filters, GraphicEQ, Loudness correction, convolution and VST host ported from Equalizer APO (GPL-2.0)."));

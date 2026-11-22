@@ -199,6 +199,10 @@ pub struct Pipeline {
     pub resets: u64,
 }
 
+fn energy(x: &[f32]) -> f64 {
+    x.iter().map(|v| (*v as f64) * (*v as f64)).sum()
+}
+
 fn sanitize(x: &mut [f32]) -> bool {
     let mut bad = false;
     for v in x.iter_mut() {
@@ -244,7 +248,7 @@ pub fn build_chain(p: &Preset, bld: &mut Builder) -> (Box<Chain>, Vec<(u32, Stri
         if let Some(e) = e {
             errs.push((b.id, e));
         }
-        slots.push(Slot { id: b.id, enabled: b.enabled, fx });
+        slots.push(Slot { id: b.id, enabled: b.enabled, fx, e: (0.0, 0.0) });
     }
     (Box::new(Chain { slots }), errs)
 }
@@ -294,14 +298,12 @@ impl Pipeline {
     }
 
     /// Troca o modelo do DeepFilterNet (aloca; só ao mudar o modo de latência).
-    pub fn set_model(&mut self, ll: bool) {
-        if ll == self.ll {
-            return;
-        }
-        if let Ok(n) = Dfn::with_model(self.atten, self.post, ll) {
-            self.dfn = n;
+    pub fn set_model(&mut self, ll: bool) -> Result<(), String> {
+        if ll != self.ll {
+            self.dfn = Dfn::with_model(self.atten, self.post, ll)?;
             self.ll = ll;
         }
+        Ok(())
     }
 
     pub fn set_atten(&mut self, db: f32) {
@@ -344,6 +346,16 @@ impl Pipeline {
                     l.set(c, r);
                 }
             }
+            Cmd::Comp(id, p) => {
+                if let Some(Slot { fx: Fx::Comp(c), .. }) = self.chain.slot(id) {
+                    c.set(p);
+                }
+            }
+            Cmd::DeEss(id, p) => {
+                if let Some(Slot { fx: Fx::DeEss(d), .. }) = self.chain.slot(id) {
+                    d.set(p);
+                }
+            }
             Cmd::Loud(id, c) => {
                 if let Some(Slot { fx: Fx::Loud(l), .. }) = self.chain.slot(id) {
                     l.set(c);
@@ -356,6 +368,7 @@ impl Pipeline {
                 push_bin(Garbage::Fx(fx), bin);
             }
             Cmd::Atten(db) => self.set_atten(db),
+            Cmd::AecTuning(t) if t == self.tuning => push_bin(Garbage::Str(t), bin),
             Cmd::AecTuning(t) => {
                 // raro: recria o AEC (aloca)
                 self.aec = Aec::from_tuning(&t);
@@ -375,6 +388,7 @@ impl Pipeline {
         if !self.bypass {
             let Pipeline { aec, dfn, chain, refb, tuning, atten, post, resets, ll, .. } = self;
             for s in chain.slots.iter_mut().filter(|s| s.enabled) {
+                let ein = energy(x);
                 match &mut s.fx {
                     Fx::Aec => {
                         let a = Instant::now();
@@ -404,9 +418,13 @@ impl Pipeline {
                     Fx::Loud(l) => l.process(x),
                     Fx::Delay(d) => d.process(x),
                     Fx::Lim(l) => t.limited |= l.process(x),
+                    Fx::Comp(c) => c.process(x),
+                    Fx::DeEss(d) => d.process(x),
                     Fx::Vst(p, io) => p.process(io, x),
                     Fx::Off => {}
                 }
+                s.e.0 += ein;
+                s.e.1 += energy(x);
             }
             t.nan |= sanitize(x);
         }

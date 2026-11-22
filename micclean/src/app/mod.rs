@@ -6,6 +6,7 @@ pub mod presets;
 pub mod settings;
 pub mod sys;
 pub mod theme;
+pub mod wizard;
 
 use cards::{Cards, Edit};
 use egui::{Color32, RichText, Stroke, vec2};
@@ -75,6 +76,12 @@ pub struct AmaApp {
     names: Vec<String>,
     preset: Preset,
     vst: BTreeMap<u32, Arc<VstPlugin>>,
+    /// VSTs fora da cadeia: a thread de áudio ainda pode ter uma cópia; liberados aqui, na thread da janela.
+    retired: Vec<(f64, Arc<VstPlugin>)>,
+    meters: BTreeMap<u32, f32>,
+    /// Preset escolhido à mão enquanto um preset por programa está ativo.
+    auto_from: Option<String>,
+    wizard: Option<wizard::Wizard>,
     errs: BTreeMap<u32, String>,
     cards: Cards,
     graph: Graph,
@@ -142,6 +149,8 @@ impl AmaApp {
             sys,
             hwnd,
             dirty_preset: None,
+            retired: Vec::new(),
+            meters: BTreeMap::new(),
             dirty_cfg: false,
             pending: BTreeMap::new(),
             ask_close: false,
@@ -152,7 +161,13 @@ impl AmaApp {
             stopped: false,
             scan: None,
             last_t: 0.0,
+            auto_from: None,
+            wizard: None,
         };
+        if app.cfg.app.setup_pending {
+            app.wizard = Some(Default::default());
+        }
+        app.sys.focus_on.store(app.cfg.app.auto_preset, Relaxed);
         app.apply_hotkeys();
         if let Some(e) = app.settings.hotkey_err.clone() {
             app.toast = Some((tr!("Atalho: {e}", "Hotkey: {e}"), 0.0, true));
@@ -202,13 +217,21 @@ impl AmaApp {
         let gone: Vec<u32> = self.vst.keys().filter(|k| !ids.contains(k)).copied().collect();
         for k in gone {
             if let Some(p) = self.vst.remove(&k) {
-                p.close_editor();
+                self.retire(p);
             }
         }
         let mut bld = Builder { vst: &mut self.vst, vol_db: self.shared.vol_db.get(), base: &self.base };
         let (chain, errs) = build_chain(&self.preset, &mut bld);
         self.errs = errs.into_iter().collect();
         self.engine.send(Cmd::SetChain(chain));
+        let aec = self.preset.blocks.iter().find_map(|b| if let Kind::Aec { tuning } = &b.kind { Some(tuning.clone()) } else { None });
+        let dfn = self.preset.blocks.iter().find_map(|b| if let Kind::Denoise { atten_db, .. } = &b.kind { Some(*atten_db) } else { None });
+        if let Some(t) = aec {
+            self.engine.send(Cmd::AecTuning(t));
+        }
+        if let Some(db) = dfn {
+            self.engine.send(Cmd::Atten(db));
+        }
         self.pending.clear();
         self.share_loud();
         self.touch();
@@ -240,6 +263,8 @@ impl AmaApp {
                 Cmd::Loud(id, loudness::coefs(*ref_level, *ref_offset, *attenuation, self.shared.vol_db.get(), sr))
             }
             Kind::Limiter { ceiling_db, release_ms } => Cmd::Lim(id, *ceiling_db, *release_ms),
+            Kind::Compressor { p } => Cmd::Comp(id, *p),
+            Kind::DeEsser { p } => Cmd::DeEss(id, *p),
             _ => return,
         };
         self.engine.send(cmd);
@@ -272,6 +297,37 @@ impl AmaApp {
         self.dirty_cfg = false;
     }
 
+    /// Leitura suavizada do medidor por bloco.
+    fn block_meters(&mut self) -> BTreeMap<u32, f32> {
+        let mut m = BTreeMap::new();
+        if self.st().bypass.load(Relaxed) {
+            self.meters.clear();
+            return m;
+        }
+        for (id, v) in micclean::stats::block_meters(self.st()) {
+            let prev = self.meters.get(&id).copied().filter(|p| p.is_finite());
+            let v = match (prev, v.is_finite()) {
+                (Some(p), true) => p + 0.2 * (v - p),
+                (_, true) => v,
+                (p, false) => p.unwrap_or(f32::NAN),
+            };
+            m.insert(id, v);
+        }
+        self.meters = m.clone();
+        m
+    }
+
+    fn retire(&mut self, p: Arc<VstPlugin>) {
+        p.close_editor();
+        self.retired.push((self.last_t, p));
+    }
+
+    fn retire_all(&mut self) {
+        for (_, p) in std::mem::take(&mut self.vst) {
+            self.retire(p);
+        }
+    }
+
     fn close_all_editors(&self) {
         for p in self.vst.values() {
             p.close_editor();
@@ -279,32 +335,70 @@ impl AmaApp {
     }
 
     fn switch_preset(&mut self, name: &str) {
-        if name == self.preset.name {
+        self.auto_from = None;
+        self.load_preset(name, true);
+    }
+
+    /// Programa em foco mudou: entra no preset dele ou volta ao escolhido à mão.
+    fn on_focus(&mut self, exe: &str) {
+        let own = std::env::current_exe().ok().and_then(|p| p.file_name().map(|f| f.to_string_lossy().to_lowercase()));
+        if !self.cfg.app.auto_preset || own.as_deref() == Some(exe) {
             return;
+        }
+        let rule = self.cfg.app.program_presets.iter().find(|r| r.exe.trim().eq_ignore_ascii_case(exe) && self.names.contains(&r.preset)).map(|r| r.preset.clone());
+        match rule {
+            Some(p) => {
+                if p != self.preset.name {
+                    let back = self.auto_from.clone().unwrap_or_else(|| self.preset.name.clone());
+                    log!("preset por programa: {exe} -> {p}");
+                    if self.load_preset(&p, false) {
+                        self.auto_from = Some(back);
+                    }
+                }
+            }
+            None => self.leave_auto(),
+        }
+    }
+
+    fn leave_auto(&mut self) {
+        if let Some(m) = self.auto_from.take() {
+            self.load_preset(&m, true);
+        }
+    }
+
+    fn load_preset(&mut self, name: &str, persist: bool) -> bool {
+        if name == self.preset.name {
+            return true;
         }
         match self.store.load(name) {
             Ok(p) => {
                 self.save_preset();
                 self.close_all_editors();
-                self.vst.clear();
+                self.retire_all();
                 self.preset = p;
                 self.sel = None;
                 self.cards.open.clear();
                 self.rebuild_all();
                 self.dirty_preset = None;
-                self.cfg.app.preset = name.to_string();
-                self.dirty_cfg = true;
+                if persist {
+                    self.cfg.app.preset = name.to_string();
+                    self.dirty_cfg = true;
+                }
                 self.sync_tray();
                 log!("preset: {name}");
+                true
             }
-            Err(e) => self.note(e, true),
+            Err(e) => {
+                self.note(e, true);
+                false
+            }
         }
     }
 
     fn adopt_new(&mut self, p: Preset) {
         self.save_preset();
         self.close_all_editors();
-        self.vst.clear();
+        self.retire_all();
         self.preset = p;
         self.sel = None;
         self.cards.open.clear();
@@ -375,7 +469,7 @@ impl AmaApp {
                     let failed = self.vst.get(&id).is_some_and(|p| p.failed.load(Relaxed)) || self.errs.contains_key(&id);
                     if on && failed {
                         if let Some(p) = self.vst.remove(&id) {
-                            p.close_editor();
+                            self.retire(p);
                         }
                         self.rebuild_one(id);
                     }
@@ -408,7 +502,7 @@ impl AmaApp {
                             params.clear();
                         }
                         if let Some(p) = self.vst.remove(&id) {
-                            p.close_editor();
+                            self.retire(p);
                         }
                         self.rebuild_one(id);
                         self.touch();
@@ -580,7 +674,8 @@ impl AmaApp {
         let mut edits = vec![];
         egui::ScrollArea::vertical().max_height(avail).auto_shrink([false, false]).show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 8.0;
-            let cx = cards::Ctx { errs: &self.errs, vst: &self.vst, sel: self.sel, vol_db: self.shared.vol_db.get() };
+            let meters = self.block_meters();
+            let cx = cards::Ctx { errs: &self.errs, vst: &self.vst, sel: self.sel, vol_db: self.shared.vol_db.get(), meters: &meters };
             edits = self.cards.show(ui, &mut self.preset.blocks, &cx);
             if self.preset.blocks.is_empty() {
                 ui.add_space(30.0);
@@ -844,8 +939,50 @@ impl AmaApp {
         }
     }
 
+    fn wizard_window(&mut self, ctx: &egui::Context) {
+        let Some(w) = &mut self.wizard else { return };
+        let mut evs = vec![];
+        let open = w.show(ctx, &self.engine.stats, &self.cfg.devices.mic, self.last_t, &mut evs);
+        if !open {
+            self.wizard = None;
+        }
+        for e in evs {
+            match e {
+                wizard::WizEv::Devices { mic, output } => {
+                    self.cfg.devices.mic = mic;
+                    if !output.is_empty() {
+                        self.cfg.devices.output = output;
+                    }
+                    self.engine.set_devices(self.cfg.devices.clone());
+                    log!("assistente: mic '{}', saída '{}'", self.cfg.devices.mic, self.cfg.devices.output);
+                    self.dirty_cfg = true;
+                }
+                wizard::WizEv::Atten(db) => {
+                    let id = self.preset.blocks.iter_mut().find_map(|b| match &mut b.kind {
+                        Kind::Denoise { atten_db, .. } => {
+                            *atten_db = db;
+                            Some(b.id)
+                        }
+                        _ => None,
+                    });
+                    match id {
+                        Some(id) => {
+                            log!("assistente: atenuação do DeepFilterNet {db:.0} dB");
+                            self.live(id);
+                        }
+                        None => self.note(t!("Este preset não tem o bloco de redução de ruído.", "This preset has no noise reduction block."), true),
+                    }
+                }
+                wizard::WizEv::Done => {
+                    self.cfg.app.setup_pending = false;
+                    self.dirty_cfg = true;
+                }
+            }
+        }
+    }
+
     fn settings_window(&mut self, ctx: &egui::Context) {
-        for e in self.settings.show(ctx, &mut self.cfg) {
+        for e in self.settings.show(ctx, &mut self.cfg, &self.names) {
             self.dirty_cfg = true;
             match e {
                 SetEdit::Devices => {
@@ -856,6 +993,16 @@ impl AmaApp {
                 SetEdit::Autostart => sys::set_autostart(self.cfg.app.autostart),
                 SetEdit::MonitorGain => self.st().monitor_gain.set(10f64.powf(self.cfg.app.monitor_gain_db / 20.0)),
                 SetEdit::VstDirs => self.scan = None,
+                SetEdit::Wizard => {
+                    self.settings.open = false;
+                    self.wizard = Some(Default::default());
+                }
+                SetEdit::AutoPreset => {
+                    self.sys.focus_on.store(self.cfg.app.auto_preset, Relaxed);
+                    if !self.cfg.app.auto_preset {
+                        self.leave_auto();
+                    }
+                }
                 SetEdit::LowLatency => {
                     self.st().low_latency.store(self.cfg.app.low_latency, Relaxed);
                 }
@@ -873,6 +1020,8 @@ impl AmaApp {
 impl eframe::App for AmaApp {
     fn logic(&mut self, ctx: &egui::Context, _f: &mut eframe::Frame) {
         self.last_t = ctx.input(|i| i.time);
+        let now = self.last_t;
+        self.retired.retain(|(t, _)| now - *t < 2.0);
         while let Ok(ev) = self.sys.rx.try_recv() {
             match ev {
                 SysEv::Show => sys::show_window(self.hwnd, ctx),
@@ -880,6 +1029,7 @@ impl eframe::App for AmaApp {
                 SysEv::Mute => self.toggle(0),
                 SysEv::Bypass => self.toggle(1),
                 SysEv::Preset(n) => self.switch_preset(&n),
+                SysEv::Focus(exe) => self.on_focus(&exe),
             }
         }
         if self.stopped {
@@ -982,6 +1132,7 @@ impl eframe::App for AmaApp {
             .show(ui, |ui| self.right_panel(ui));
         self.settings_window(&ctx);
         self.dialogs(&ctx);
+        self.wizard_window(&ctx);
         ctx.request_repaint_after(std::time::Duration::from_millis(33));
     }
 

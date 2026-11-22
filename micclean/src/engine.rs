@@ -1,5 +1,5 @@
 use crate::audio::{self, Res};
-use crate::config::{Config, Devices, out_target_ms};
+use crate::config::{Config, Devices, out_target_ms, out_target_for};
 use crate::drift::{OutPath, OutReader, RefPath};
 use crate::dsp::Pipeline;
 use crate::fx::chain::{Chain, Cmd, Garbage, Preset};
@@ -74,6 +74,7 @@ impl Engine {
                 outp: OutPath::new(out_target_ms(out_ms, ll), RING),
                 monp: OutPath::new(out_target_ms(out_ms, ll), RING),
                 out_ms,
+                targets: (out_target_ms(out_ms, ll), out_target_ms(out_ms, ll)),
                 ref_cons,
                 out_prod,
                 mon_prod,
@@ -192,6 +193,7 @@ struct Dsp {
     refb: [f32; FRAME],
     fill: usize,
     out_ms: f64,
+    targets: (f64, f64),
     stats: Arc<Stats>,
 }
 
@@ -214,12 +216,24 @@ impl Dsp {
         }
         let ll = st.low_latency.load(Relaxed);
         if ll != self.pipe.ll {
-            self.pipe.set_model(ll);
-            let t = out_target_ms(self.out_ms, ll);
-            self.outp.set_target(t);
-            self.monp.set_target(t);
-            log!("modo de baixa latência: {}", if ll { "ligado" } else { "desligado" });
+            match self.pipe.set_model(ll) {
+                Ok(()) => log!("modo de baixa latência: {}", if ll { "ligado" } else { "desligado" }),
+                Err(e) => {
+                    log!("modo de baixa latência: {e}");
+                    st.low_latency.store(self.pipe.ll, Relaxed);
+                }
+            }
         }
+        let ll = self.pipe.ll;
+        let t = (out_target_for(self.out_ms, ll, st.out_period.load(Relaxed)), out_target_for(self.out_ms, ll, st.mon_period.load(Relaxed)));
+        if t.0 != self.targets.0 {
+            self.outp.set_target(t.0);
+            log!("alvo do buffer de saída: {:.1} ms", t.0);
+        }
+        if t.1 != self.targets.1 {
+            self.monp.set_target(t.1);
+        }
+        self.targets = t;
         self.pipe.mute = st.mute.load(Relaxed);
         self.pipe.bypass = st.bypass.load(Relaxed);
         let t0 = Instant::now();
@@ -231,6 +245,7 @@ impl Dsp {
             inc(&st.ref_overruns);
         }
         peak_max(&st.in_peak, &self.frame);
+        st.in_ms.set(self.frame.iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>() / FRAME as f64);
         let t = self.pipe.process(&mut self.frame, &self.refb);
         peak_max(&st.out_peak, &self.frame);
         let ev = self.outp.push(&self.frame, &mut self.out_prod);
@@ -261,6 +276,18 @@ impl Dsp {
         st.aec_ns_max.fetch_max(t.aec_ns, Relaxed);
         st.dfn_ns_max.fetch_max(t.dfn_ns, Relaxed);
         let n = st.frames.fetch_add(1, Relaxed);
+        if n % 10 == 0 {
+            // ~-60 dBFS de média em 100 ms: abaixo disso não mede
+            let floor = 1e-6 * (10 * FRAME) as f64;
+            let mut k = 0;
+            for s in self.pipe.chain.slots.iter_mut().take(crate::stats::MAX_BLOCKS) {
+                let (a, b) = std::mem::take(&mut s.e);
+                let v = if a > floor { (10.0 * ((b + 1e-12) / a).log10()) as f32 } else { f32::NAN };
+                st.blocks[k].store(((s.id as u64) << 32) | v.to_bits() as u64, Relaxed);
+                k += 1;
+            }
+            st.nblocks.store(k as u32, Relaxed);
+        }
         if n % 100 == 0 {
             let ms = 1000.0 / SR as f64;
             st.out_ppm.set(self.outp.ctl.drift_ppm());
@@ -421,7 +448,8 @@ fn ref_thread(devs: Arc<DevState>, mut prod: Producer<f32>, st: Arc<Stats>, stop
 
 /// Saída para o CABLE ou, com `monitor`, escuta no fone (só enquanto ligada).
 fn out_thread(devs: Arc<DevState>, mut cons: Consumer<f32>, out_ms: f64, st: Arc<Stats>, stop: Arc<AtomicBool>, monitor: bool) {
-    let target = |ll: bool| (out_target_ms(out_ms, ll) * SR as f64 / 1000.0) as usize;
+    let period = if monitor { &st.mon_period } else { &st.out_period };
+    let target = |ll: bool| (out_target_for(out_ms, ll, period.load(Relaxed)) * SR as f64 / 1000.0) as usize;
     audio::com_init();
     let _mm = audio::mmcss_pro_audio();
     let mut last_err = String::new();
@@ -447,11 +475,12 @@ fn out_thread(devs: Arc<DevState>, mut cons: Consumer<f32>, out_ms: f64, st: Arc
                     audio::open_render(&dev, 2, None)?
                 }
             };
+            let bf = r.buffer_frames as usize;
+            let per = r.period as usize;
+            period.store(r.period, Relaxed);
             let mut ll = st.low_latency.load(Relaxed);
             let mut reader = OutReader::new(target(ll));
             // fila no dispositivo: 3 períodos curtos ou 1,5 do padrão de 10 ms
-            let bf = r.buffer_frames as usize;
-            let per = r.period as usize;
             let queue = if per < 400 { 3 * per } else { per + per / 2 }.min(bf);
             let mut warm = 0;
             r.write_silence(queue)?;
@@ -503,6 +532,7 @@ fn out_thread(devs: Arc<DevState>, mut cons: Consumer<f32>, out_ms: f64, st: Arc
             Ok(())
         })();
         ok.store(false, Relaxed);
+        period.store(0, Relaxed);
         if let Err(e) = r {
             if e != last_err {
                 log!("{tag}: {e} (tentando de novo)");

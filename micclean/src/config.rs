@@ -54,6 +54,11 @@ pub fn out_target_ms(out_ms: f64, low_latency: bool) -> f64 {
     if low_latency { out_ms + 4.0 } else { out_ms }
 }
 
+/// Alvo do buffer de saída para um render com `period` frames: nunca menos que 2 períodos.
+pub fn out_target_for(out_ms: f64, low_latency: bool, period: u32) -> f64 {
+    out_target_ms(out_ms, low_latency).max(2.0 * period as f64 * 1000.0 / crate::SR as f64)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Buffers {
@@ -84,6 +89,19 @@ pub struct App {
     pub language: String,
     /// Modelo DeepFilterNet sem lookahead e buffers mínimos.
     pub low_latency: bool,
+    /// Troca o preset conforme o programa em foco.
+    pub auto_preset: bool,
+    pub program_presets: Vec<ProgramPreset>,
+    /// Abre o assistente de primeiro uso (só em instalação nova).
+    pub setup_pending: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProgramPreset {
+    /// Nome do exe, ex.: "cs2.exe"
+    pub exe: String,
+    pub preset: String,
 }
 
 impl Default for Config {
@@ -153,6 +171,9 @@ impl Default for App {
             window: [1280.0, 800.0],
             language: "pt".into(),
             low_latency: false,
+            auto_preset: false,
+            program_presets: vec![],
+            setup_pending: false,
         }
     }
 }
@@ -206,11 +227,13 @@ pub fn exe_dir() -> PathBuf {
 
 impl Config {
     pub fn load_or_create(path: &Path) -> Result<Config, String> {
-        if !path.exists() {
+        let new = !path.exists();
+        if new {
             std::fs::write(path, DEFAULT_TOML).map_err(|e| format!("{path:?}: {e}"))?;
         }
         let s = std::fs::read_to_string(path).map_err(|e| format!("{path:?}: {e}"))?;
         let mut c: Config = toml::from_str(&s).map_err(|e| format!("{path:?}: {e}"))?;
+        c.app.setup_pending |= new;
         // 20 ms era o padrão antigo: com o render rápido não precisa mais
         if c.buffers.out_ms == 20.0 {
             c.buffers.out_ms = OUT_MS;

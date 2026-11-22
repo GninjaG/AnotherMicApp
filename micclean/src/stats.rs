@@ -7,6 +7,9 @@ pub struct Stats {
     /// O render do CABLE ficou vazio antes de escrevermos (o Windows tocou silêncio).
     pub out_starves: AtomicU64,
     pub low_latency: AtomicBool,
+    /// Período do render da saída e da escuta em frames (0 = desconectado).
+    pub out_period: AtomicU32,
+    pub mon_period: AtomicU32,
     pub out_overruns: AtomicU64,
     pub ref_underruns: AtomicU64,
     pub ref_overruns: AtomicU64,
@@ -40,6 +43,22 @@ pub struct Stats {
     pub mon_ok: AtomicBool,
     pub proc_ms_avg: AtomicF64,
     pub cpu_pct: AtomicF64,
+    /// Por bloco: id nos 32 bits altos, dB (f32) nos baixos. NaN = sem sinal ou desligado.
+    pub blocks: [AtomicU64; MAX_BLOCKS],
+    pub nblocks: AtomicU32,
+    /// Média quadrática do último quadro do mic, antes de qualquer bloco.
+    pub in_ms: AtomicF64,
+}
+
+pub const MAX_BLOCKS: usize = 32;
+
+/// (id, quanto o bloco muda o nível em dB).
+pub fn block_meters(st: &Stats) -> Vec<(u32, f32)> {
+    let n = (st.nblocks.load(Relaxed) as usize).min(MAX_BLOCKS);
+    st.blocks[..n].iter().map(|a| {
+        let v = a.load(Relaxed);
+        ((v >> 32) as u32, f32::from_bits(v as u32))
+    }).collect()
 }
 
 pub fn peak_max(a: &AtomicU32, x: &[f32]) {

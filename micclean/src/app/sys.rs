@@ -3,7 +3,7 @@ use global_hotkey::hotkey::{Code, HotKey, Modifiers};
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 use micclean::log;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicIsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem, Submenu};
@@ -15,6 +15,8 @@ pub enum SysEv {
     Mute,
     Bypass,
     Preset(String),
+    /// Programa em foco mudou (nome do exe em minúsculas).
+    Focus(String),
 }
 
 pub fn icon_rgba(n: u32) -> Vec<u8> {
@@ -64,6 +66,8 @@ pub struct Sys {
     hk_keys: Vec<HotKey>,
     preset_ids: Option<Arc<Mutex<Vec<(MenuId, String)>>>>,
     pub hwnd: Arc<AtomicIsize>,
+    /// Liga a thread que acompanha o programa em foco (presets por programa).
+    pub focus_on: Arc<AtomicBool>,
 }
 
 impl Sys {
@@ -88,7 +92,30 @@ impl Sys {
             let _ = t.send(ev);
             c.request_repaint();
         }));
-        Sys { rx, tx, tray: None, hk: GlobalHotKeyManager::new().ok(), hk_ids, hk_keys: vec![], preset_ids: None, hwnd: Default::default() }
+        let focus_on: Arc<AtomicBool> = Default::default();
+        let (on, t, c) = (focus_on.clone(), tx.clone(), ctx.clone());
+        std::thread::Builder::new()
+            .name("focus".into())
+            .spawn(move || {
+                let mut last = String::new();
+                loop {
+                    std::thread::sleep(std::time::Duration::from_millis(400));
+                    if !on.load(Relaxed) {
+                        last.clear();
+                        continue;
+                    }
+                    let Some(exe) = foreground_exe() else { continue };
+                    if exe != last {
+                        last = exe.clone();
+                        if t.send(SysEv::Focus(exe)).is_err() {
+                            return;
+                        }
+                        c.request_repaint();
+                    }
+                }
+            })
+            .ok();
+        Sys { rx, tx, tray: None, hk: GlobalHotKeyManager::new().ok(), hk_ids, hk_keys: vec![], preset_ids: None, hwnd: Default::default(), focus_on }
     }
 
     pub fn build_tray(&mut self, ctx: &egui::Context, presets: &[String], current: &str) {
@@ -330,6 +357,61 @@ pub fn hwnd_of(cc: &eframe::CreationContext) -> Option<isize> {
         RawWindowHandle::Win32(h) => Some(h.hwnd.get()),
         _ => None,
     }
+}
+
+fn exe_of_window(h: windows::Win32::Foundation::HWND) -> Option<String> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::*;
+    use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
+    unsafe {
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(h, Some(&mut pid));
+        if pid == 0 {
+            return None;
+        }
+        let p = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        let mut buf = [0u16; 1024];
+        let mut n = buf.len() as u32;
+        let r = QueryFullProcessImageNameW(p, PROCESS_NAME_WIN32, windows::core::PWSTR(buf.as_mut_ptr()), &mut n);
+        let _ = CloseHandle(p);
+        r.ok()?;
+        let path = String::from_utf16_lossy(&buf[..n as usize]);
+        std::path::Path::new(&path).file_name().map(|f| f.to_string_lossy().to_lowercase())
+    }
+}
+
+/// Exe do programa em foco, em minúsculas (ex.: "cs2.exe").
+pub fn foreground_exe() -> Option<String> {
+    let h = unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() };
+    if h.0.is_null() {
+        return None;
+    }
+    exe_of_window(h)
+}
+
+/// Programas com janela visível agora (para escolher em Ajustes).
+pub fn window_programs() -> Vec<String> {
+    use windows::Win32::Foundation::{HWND, LPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::*;
+    use windows::core::BOOL;
+    unsafe extern "system" fn cb(h: HWND, l: LPARAM) -> BOOL {
+        unsafe {
+            let v = &mut *(l.0 as *mut Vec<HWND>);
+            if IsWindowVisible(h).as_bool() && GetWindowTextLengthW(h) > 0 && GetWindow(h, GW_OWNER).map(|o| o.0.is_null()).unwrap_or(true) {
+                v.push(h);
+            }
+        }
+        BOOL(1)
+    }
+    let mut hs: Vec<HWND> = vec![];
+    unsafe {
+        let _ = EnumWindows(Some(cb), LPARAM(&mut hs as *mut _ as isize));
+    }
+    let own = std::env::current_exe().ok().and_then(|p| p.file_name().map(|f| f.to_string_lossy().to_lowercase()));
+    let mut v: Vec<String> = hs.into_iter().filter_map(exe_of_window).filter(|e| Some(e) != own.as_ref() && e != "explorer.exe" && e != "applicationframehost.exe" && e != "textinputhost.exe").collect();
+    v.sort();
+    v.dedup();
+    v
 }
 
 /// Mostra a janela direto pelo Win32 (funciona mesmo com o egui parado enquanto oculto).

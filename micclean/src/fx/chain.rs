@@ -1,5 +1,6 @@
 use super::biquad::{BqParams, Biquad, Coefs};
 use super::conv::{Conv, load_ir};
+use super::dynamics::{Comp, CompParams, DeEss, DeEssParams};
 use super::loudness::LoudCoefs;
 use super::vst::{VstIo, VstPlugin};
 use crate::{FRAME, SR};
@@ -27,6 +28,8 @@ pub enum Kind {
     Convolution { file: String },
     Delay { ms: f64 },
     Limiter { ceiling_db: f64, release_ms: f64 },
+    Compressor { p: CompParams },
+    DeEsser { p: DeEssParams },
     Vst { library: String, chunk: Option<String>, params: BTreeMap<String, f32> },
 }
 
@@ -42,6 +45,8 @@ impl Kind {
             Kind::Convolution { .. } => "Convolução",
             Kind::Delay { .. } => "Delay",
             Kind::Limiter { .. } => "Limitador",
+            Kind::Compressor { .. } => "Compressor",
+            Kind::DeEsser { .. } => "De-esser",
             Kind::Vst { .. } => "Plugin VST",
         }
     }
@@ -170,6 +175,8 @@ pub enum Fx {
     Loud(Loud),
     Delay(DelayLine),
     Lim(Lim),
+    Comp(Comp),
+    DeEss(DeEss),
     Vst(Arc<VstPlugin>, VstIo),
     Off,
 }
@@ -178,6 +185,8 @@ pub struct Slot {
     pub id: u32,
     pub enabled: bool,
     pub fx: Fx,
+    /// Energia na entrada e na saída desde a última leitura do medidor.
+    pub e: (f64, f64),
 }
 
 pub struct Chain {
@@ -216,6 +225,8 @@ impl Builder<'_> {
             }
             Kind::Delay { ms } => (Fx::Delay(DelayLine::new((ms.clamp(0.0, 10_000.0) * SR as f64 / 1000.0) as usize)), None),
             Kind::Limiter { ceiling_db, release_ms } => (Fx::Lim(Lim::new(*ceiling_db, *release_ms)), None),
+            Kind::Compressor { p } => (Fx::Comp(Comp::new(*p)), None),
+            Kind::DeEsser { p } => (Fx::DeEss(DeEss::new(*p)), None),
             Kind::Vst { library, chunk, params } => {
                 let p = match self.vst.get(&b.id) {
                     Some(p) => p.clone(),
@@ -242,6 +253,8 @@ pub enum Cmd {
     Coefs(u32, Coefs),
     Gain(u32, f32),
     Lim(u32, f64, f64),
+    Comp(u32, CompParams),
+    DeEss(u32, DeEssParams),
     Loud(u32, LoudCoefs),
     Replace(u32, Box<Fx>),
     Atten(f32),
