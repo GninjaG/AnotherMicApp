@@ -1,0 +1,55 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: micclean
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: micclean
+
+      - name: Check version
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}".TrimStart("v")
+          $ver = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
+          if ($tag -ne $ver) { throw "tag $tag does not match Cargo.toml version $ver" }
+
+      - name: Test
+        run: cargo test --release --lib
+
+      - name: Build
+        run: cargo build --release --bin AMA
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $name = "AMA-${{ github.ref_name }}-windows-x64"
+          New-Item -ItemType Directory -Force $name | Out-Null
+          Copy-Item target/release/AMA.exe $name/
+          Copy-Item ../README.md $name/
+          Compress-Archive -Path $name/* -DestinationPath "$name.zip"
+          Copy-Item target/release/AMA.exe AMA.exe
+          (Get-FileHash AMA.exe -Algorithm SHA256).Hash.ToLower() + "  AMA.exe" | Out-File -Encoding ascii AMA.exe.sha256
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            micclean/AMA-${{ github.ref_name }}-windows-x64.zip
+            micclean/AMA.exe
+            micclean/AMA.exe.sha256

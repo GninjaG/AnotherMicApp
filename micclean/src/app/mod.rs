@@ -6,6 +6,7 @@ pub mod presets;
 pub mod settings;
 pub mod sys;
 pub mod theme;
+pub mod update;
 pub mod wizard;
 
 use cards::{Cards, Edit};
@@ -55,6 +56,18 @@ pub fn ctl_thread(engine: Arc<Engine>, sh: Arc<Shared>) {
     }
 }
 
+enum Upd {
+    None,
+    Available(update::Release),
+    Installing(String),
+}
+
+enum UpdMsg {
+    Found(update::Release),
+    Installed(std::path::PathBuf),
+    Failed(String),
+}
+
 enum NameKind {
     New,
     Duplicate,
@@ -82,6 +95,8 @@ pub struct AmaApp {
     /// Preset escolhido à mão enquanto um preset por programa está ativo.
     auto_from: Option<String>,
     wizard: Option<wizard::Wizard>,
+    upd: Upd,
+    upd_rx: Option<std::sync::mpsc::Receiver<UpdMsg>>,
     errs: BTreeMap<u32, String>,
     cards: Cards,
     graph: Graph,
@@ -163,7 +178,25 @@ impl AmaApp {
             last_t: 0.0,
             auto_from: None,
             wizard: None,
+            upd: Upd::None,
+            upd_rx: None,
         };
+        if app.cfg.app.check_updates {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let c = cc.egui_ctx.clone();
+            std::thread::spawn(move || {
+                match update::check() {
+                    Ok(Some(r)) => {
+                        log!("atualização disponível: {}", r.tag);
+                        let _ = tx.send(UpdMsg::Found(r));
+                    }
+                    Ok(None) => {}
+                    Err(e) => log!("procurar atualização: {e}"),
+                }
+                c.request_repaint();
+            });
+            app.upd_rx = Some(rx);
+        }
         if app.cfg.app.setup_pending {
             app.wizard = Some(Default::default());
         }
@@ -576,6 +609,78 @@ impl AmaApp {
         self.engine.stop();
         self.engine.collect();
         log!("AMA encerrado");
+    }
+
+    fn start_update(&mut self, ctx: &egui::Context, r: update::Release) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let c = ctx.clone();
+        self.upd = Upd::Installing(r.tag.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send(match update::install(&r) {
+                Ok(p) => UpdMsg::Installed(p),
+                Err(e) => UpdMsg::Failed(e),
+            });
+            c.request_repaint();
+        });
+        self.upd_rx = Some(rx);
+    }
+
+    fn poll_update(&mut self, ctx: &egui::Context) {
+        let Some(rx) = &self.upd_rx else { return };
+        let Ok(m) = rx.try_recv() else { return };
+        self.upd_rx = None;
+        match m {
+            UpdMsg::Found(r) => self.upd = Upd::Available(r),
+            UpdMsg::Installed(exe) => {
+                self.upd = Upd::None;
+                match std::process::Command::new(&exe).arg("--after-update").spawn() {
+                    Ok(_) => self.quit(ctx),
+                    Err(e) => self.note(tr!("Atualizado, mas não consegui abrir de novo: {e}. Abra o AMA outra vez.", "Updated, but could not restart: {e}. Open AMA again."), true),
+                }
+            }
+            UpdMsg::Failed(e) => {
+                self.upd = Upd::None;
+                self.note(tr!("A atualização falhou: {e}", "The update failed: {e}"), true);
+            }
+        }
+    }
+
+    fn update_bar(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        let mut go = None;
+        ui.horizontal(|ui| {
+            match &self.upd {
+                Upd::Available(r) => {
+                    ui.label(RichText::new(tr!("AMA {} disponível", "AMA {} available", r.tag)).font(semibold(13.5)).color(TEXT));
+                    label_muted(ui, tr!("(você tem a {})", "(you have {})", env!("CARGO_PKG_VERSION")));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button(t!("Depois", "Later")).clicked() {
+                            go = Some(false);
+                        }
+                        if !r.page.is_empty() {
+                            ui.hyperlink_to(t!("Novidades", "What's new"), &r.page);
+                        }
+                        if ui.add(egui::Button::new(RichText::new(t!("Atualizar", "Update")).color(Color32::WHITE)).fill(ACCENT_DIM)).clicked() {
+                            go = Some(true);
+                        }
+                    });
+                }
+                Upd::Installing(tag) => {
+                    ui.spinner();
+                    label_muted(ui, tr!("Baixando o AMA {tag}. Ele reabre sozinho quando terminar.", "Downloading AMA {tag}. It reopens by itself when done."));
+                }
+                Upd::None => {}
+            }
+        });
+        match go {
+            Some(true) => {
+                if let Upd::Available(r) = std::mem::replace(&mut self.upd, Upd::None) {
+                    self.start_update(&ctx, r);
+                }
+            }
+            Some(false) => self.upd = Upd::None,
+            None => {}
+        }
     }
 
     fn quit(&mut self, ctx: &egui::Context) {
@@ -1032,6 +1137,7 @@ impl eframe::App for AmaApp {
                 SysEv::Focus(exe) => self.on_focus(&exe),
             }
         }
+        self.poll_update(ctx);
         if self.stopped {
             return;
         }
@@ -1116,6 +1222,12 @@ impl eframe::App for AmaApp {
             self.m_out.feed(po, self.last_t, dt);
         }
 
+        if !matches!(self.upd, Upd::None) {
+            egui::Panel::top("update")
+                .frame(egui::Frame::new().fill(CARD_HI).inner_margin(egui::Margin { left: 18, right: 18, top: 8, bottom: 8 }))
+                .show_separator_line(false)
+                .show(ui, |ui| self.update_bar(ui));
+        }
         egui::Panel::top("top")
             .frame(egui::Frame::new().fill(PANEL).inner_margin(egui::Margin { left: 18, right: 18, top: 12, bottom: 12 }))
             .show_separator_line(false)

@@ -94,6 +94,8 @@ pub struct App {
     pub program_presets: Vec<ProgramPreset>,
     /// Abre o assistente de primeiro uso (só em instalação nova).
     pub setup_pending: bool,
+    /// Procura versão nova nos releases do GitHub ao abrir.
+    pub check_updates: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -174,6 +176,7 @@ impl Default for App {
             auto_preset: false,
             program_presets: vec![],
             setup_pending: false,
+            check_updates: true,
         }
     }
 }

@@ -21,13 +21,25 @@ fn message(text: &str) {
 }
 
 /// Só uma instância: a segunda apenas traz a janela da primeira para a frente.
-fn already_running() -> bool {
+fn already_running(after_update: bool) -> bool {
     use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError};
     use windows::Win32::System::Threading::CreateMutexW;
     use windows::Win32::UI::WindowsAndMessaging::FindWindowW;
     use windows::core::w;
     unsafe {
-        let _ = CreateMutexW(None, true, w!("Local\\AMA_AnotherMicApp"));
+        let mut tries = if after_update { 150 } else { 0 };
+        loop {
+            let h = CreateMutexW(None, true, w!("Local\\AMA_AnotherMicApp"));
+            if GetLastError() != ERROR_ALREADY_EXISTS || tries == 0 {
+                break;
+            }
+            // a versão anterior ainda está fechando
+            if let Ok(h) = h {
+                let _ = windows::Win32::Foundation::CloseHandle(h);
+            }
+            tries -= 1;
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
         if GetLastError() == ERROR_ALREADY_EXISTS {
             if let Ok(h) = FindWindowW(None, w!("AMA")) {
                 app::sys::raise(h.0 as isize);
@@ -75,7 +87,7 @@ fn main() {
         return;
     }
 
-    if already_running() {
+    if already_running(has("--after-update")) {
         return;
     }
     let start_hidden = has("--tray");

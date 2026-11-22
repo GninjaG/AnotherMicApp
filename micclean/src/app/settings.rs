@@ -243,6 +243,12 @@ impl Settings {
                         }
                     });
 
+                    row(ui, "", |ui| {
+                        if ui.checkbox(&mut cfg.app.check_updates, t!("Procurar versão nova ao abrir (pergunta antes de instalar)", "Look for a new version on start (asks before installing)")).changed() {
+                            out.push(SetEdit::Saved);
+                        }
+                    });
+
                     section(ui, t!("Presets por programa", "Per-program presets"));
                     row(ui, "", |ui| {
                         if ui.checkbox(&mut cfg.app.auto_preset, t!("Trocar o preset conforme o programa em foco", "Switch the preset based on the focused program")).changed() {

@@ -158,7 +158,8 @@ impl Cards {
                         let ch = chevron(ui, open);
                         if let Some(&d) = cx.meters.get(&id).filter(|d| d.is_finite() && b.enabled) {
                             let c = if d.abs() < 0.5 { FAINT } else if d > 3.0 { WARN } else { MUTED };
-                            ui.label(RichText::new(format!("{d:+.1} dB")).monospace().size(11.5).color(c))
+                            let s = if d < -60.0 { "< -60 dB".to_string() } else { format!("{d:+.1} dB") };
+                            ui.label(RichText::new(s).monospace().size(11.5).color(c))
                                 .on_hover_text(t!("Quanto este bloco muda o nível agora", "How much this block changes the level right now"));
                         }
                         let rest = ui.available_rect_before_wrap();
