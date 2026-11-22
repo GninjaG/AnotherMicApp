@@ -1,5 +1,6 @@
 #[macro_use]
 pub mod i18n;
+pub mod cable;
 pub mod cards;
 pub mod graph;
 pub mod presets;

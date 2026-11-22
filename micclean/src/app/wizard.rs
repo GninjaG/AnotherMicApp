@@ -21,6 +21,7 @@ pub struct Wizard {
     noise_db: Option<f32>,
     atten: f64,
     loaded: bool,
+    lat: super::cable::CableUi,
 }
 
 const MEASURE_S: f64 = 3.0;
@@ -33,41 +34,6 @@ pub fn suggest_atten(noise_db: f32) -> f32 {
         n if n < -50.0 => 24.0,
         n if n < -40.0 => 36.0,
         _ => 100.0,
-    }
-}
-
-/// O VBCABLE_ControlPanel.exe vem no zip do VB-Cable; o instalador não copia.
-fn cable_panel() -> Option<std::path::PathBuf> {
-    const EXE: &str = "VBCABLE_ControlPanel.exe";
-    let mut dirs = vec![std::path::PathBuf::from(r"C:\Program Files\VB\CABLE")];
-    if let Some(home) = std::env::var_os("USERPROFILE") {
-        for sub in ["Downloads", "Desktop", r"OneDrive\Desktop"] {
-            let d = std::path::Path::new(&home).join(sub);
-            dirs.push(d.clone());
-            if let Ok(rd) = std::fs::read_dir(&d) {
-                dirs.extend(rd.flatten().filter(|e| e.file_name().to_string_lossy().to_lowercase().contains("cable")).map(|e| e.path()));
-            }
-        }
-    }
-    dirs.into_iter().map(|d| d.join(EXE)).find(|p| p.is_file())
-}
-
-/// Dica para baixar o buffer interno do VB-Cable, que é a maior parte da latência.
-pub fn cable_latency_tip(ui: &mut egui::Ui) {
-    label_muted(ui, t!(
-        "O VB-Cable guarda até 7168 amostras (uns 150 ms) por padrão. No painel dele, ponha Max Latency em 1024 (ou 512) e reinicie o PC: corta uns 50 a 60 ms.",
-        "VB-Cable buffers up to 7168 samples (about 150 ms) by default. In its control panel, set Max Latency to 1024 (or 512) and restart the PC: it cuts about 50 to 60 ms."
-    ));
-    match cable_panel() {
-        Some(p) => {
-            if ui.button(t!("Abrir o painel do VB-Cable", "Open the VB-Cable panel")).clicked() {
-                let _ = std::process::Command::new("explorer").arg(&p).spawn();
-            }
-        }
-        None => {
-            label_muted(ui, t!("O painel (VBCABLE_ControlPanel.exe) vem no zip do VB-Cable.", "The panel (VBCABLE_ControlPanel.exe) comes in the VB-Cable zip."));
-            ui.hyperlink_to("vb-audio.com/Cable", "https://vb-audio.com/Cable/");
-        }
     }
 }
 
@@ -135,7 +101,9 @@ impl Wizard {
                 ui.label(RichText::new(tr!("Encontrado: {n}", "Found: {n}")).color(OK));
                 label_muted(ui, t!("O AMA manda a voz tratada para ele, e o Discord lê do outro lado.", "AMA sends the cleaned voice into it, and Discord reads it on the other end."));
                 ui.add_space(6.0);
-                cable_latency_tip(ui);
+                ui.label(RichText::new(t!("Buffer do VB-Cable", "VB-Cable buffer")).font(semibold(13.0)));
+                label_muted(ui, t!("Menor = voz chega antes. O padrão do VB-Cable é bem alto.", "Lower = the voice arrives sooner. VB-Cable's default is quite high."));
+                self.lat.show(ui);
                 ui.add_space(8.0);
                 if primary(ui, t!("Próximo", "Next")) {
                     self.step = 1;

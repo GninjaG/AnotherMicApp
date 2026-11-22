@@ -87,6 +87,9 @@ fn main() {
         return;
     }
 
+    if let Some(i) = args.iter().position(|a| a == app::cable::ARG) {
+        std::process::exit(app::cable::elevated_main(args.get(i + 1).map(|s| s.as_str()).unwrap_or("")));
+    }
     if already_running(has("--after-update")) {
         return;
     }

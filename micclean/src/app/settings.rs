@@ -14,6 +14,7 @@ pub struct Settings {
     seen: u64,
     programs: Vec<String>,
     pub hotkey_err: Option<String>,
+    lat: super::cable::CableUi,
 }
 
 pub enum SetEdit {
@@ -59,14 +60,15 @@ fn section(ui: &mut egui::Ui, t: &str) {
     ui.add_space(2.0);
 }
 
-fn row(ui: &mut egui::Ui, name: &str, add: impl FnOnce(&mut egui::Ui)) {
+fn row(ui: &mut egui::Ui, name: &str, add: impl FnOnce(&mut egui::Ui)) -> egui::Response {
     ui.horizontal(|ui| {
         ui.allocate_ui_with_layout(vec2(170.0, 24.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
             ui.set_min_width(170.0);
             ui.label(RichText::new(name).color(MUTED));
         });
         add(ui);
-    });
+    })
+    .response
 }
 
 impl Settings {
@@ -170,31 +172,12 @@ impl Settings {
                     let d = &mut cfg.devices;
                     let mut dc = false;
                     row(ui, t!("Microfone", "Microphone"), |ui| dc |= dev_combo(ui, "dev-mic", &mut d.mic, &self.caps, true));
-                    row(ui, t!("Saída (para o Discord)", "Output (for Discord)"), |ui| dc |= dev_combo(ui, "dev-out", &mut d.output, &self.rends, false));
-                    row(ui, t!("Referência do eco", "Echo reference"), |ui| dc |= dev_combo(ui, "dev-ref", &mut d.speakers, &self.rends, true));
-                    row(ui, t!("Escuta", "Monitor"), |ui| dc |= dev_combo(ui, "dev-mon", &mut d.monitor, &self.rends, true));
-                    row(ui, "", |ui| {
-                        dc |= ui.checkbox(&mut d.mic_raw, t!("Modo RAW no microfone (ignora efeitos do Windows)", "RAW mode on the mic (skips Windows effects)")).changed();
-                    });
-                    row(ui, "", |ui| {
-                        label_muted(ui, t!("Vale na hora. A lista se atualiza sozinha ao ligar ou tirar um aparelho.", "Applies right away. The list updates itself when you plug or unplug a device."));
-                    });
-                    if dc {
-                        out.push(SetEdit::Devices);
-                    }
-                    row(ui, "", |ui| {
-                        if ui.checkbox(&mut cfg.app.low_latency, t!("Modo de baixa latência", "Low latency mode")).changed() {
-                            out.push(SetEdit::LowLatency);
-                        }
-                    });
-                    row(ui, "", |ui| {
-                        label_muted(ui, t!("Usa o DeepFilterNet sem lookahead: uns 10 ms a menos, limpa um pouco pior e usa mais CPU.", "Uses DeepFilterNet without lookahead: about 10 ms less, slightly worse cleanup and more CPU."));
-                    });
-                    if cfg.devices.output.to_lowercase().contains("cable") {
-                        row(ui, "", |ui| {
-                            ui.vertical(|ui| super::wizard::cable_latency_tip(ui));
-                        });
-                    }
+                    row(ui, t!("Saída (para os programas)", "Output (for apps)"), |ui| dc |= dev_combo(ui, "dev-out", &mut d.output, &self.rends, false))
+                        .on_hover_text(t!("Escolha CABLE Input. Nos programas (Discord, jogos), use CABLE Output como microfone.", "Pick CABLE Input. In apps (Discord, games), use CABLE Output as the microphone."));
+                    row(ui, t!("Referência do eco", "Echo reference"), |ui| dc |= dev_combo(ui, "dev-ref", &mut d.speakers, &self.rends, true))
+                        .on_hover_text(t!("Onde você ouve o jogo e a call. O AMA tira esse som do mic.", "Where you hear the game and the call. AMA removes that sound from the mic."));
+                    row(ui, t!("Escuta", "Monitor"), |ui| dc |= dev_combo(ui, "dev-mon", &mut d.monitor, &self.rends, true))
+                        .on_hover_text(t!("Onde você se ouve com o botão Escuta ligado.", "Where you hear yourself when Monitor is on."));
                     let mut g = cfg.app.monitor_gain_db;
                     row(ui, t!("Volume da escuta", "Monitor volume"), |ui| {
                         ui.spacing_mut().slider_width = 300.0;
@@ -203,6 +186,30 @@ impl Settings {
                         }
                     });
                     cfg.app.monitor_gain_db = g;
+                    let d = &mut cfg.devices;
+                    row(ui, t!("Efeitos do Windows", "Windows effects"), |ui| {
+                        dc |= ui.checkbox(&mut d.mic_raw, t!("Ignorar (modo RAW)", "Skip them (RAW mode)")).changed();
+                    })
+                    .on_hover_text(t!("Desliga realces do driver do mic, que costumam brigar com o AMA.", "Turns off the mic driver's enhancements, which tend to fight with AMA."));
+                    if dc {
+                        out.push(SetEdit::Devices);
+                    }
+
+                    section(ui, t!("Latência", "Latency"));
+                    row(ui, t!("Modo rápido", "Fast mode"), |ui| {
+                        if ui.checkbox(&mut cfg.app.low_latency, t!("Ligado", "On")).changed() {
+                            out.push(SetEdit::LowLatency);
+                        }
+                    })
+                    .on_hover_text(t!("DeepFilterNet sem lookahead: uns 10 ms a menos, limpa um pouco pior e usa mais CPU.", "DeepFilterNet without lookahead: about 10 ms less, slightly worse cleanup and more CPU."));
+                    row(ui, t!("Buffer do VB-Cable", "VB-Cable buffer"), |ui| {
+                        ui.vertical(|ui| {
+                            if !self.lat.show(ui) {
+                                label_muted(ui, t!("VB-Cable não instalado", "VB-Cable not installed"));
+                            }
+                        });
+                    })
+                    .on_hover_text(t!("Quanto o VB-Cable segura antes de entregar. Menor = voz chega antes.", "How much VB-Cable holds before delivering. Lower = the voice arrives sooner."));
 
                     section(ui, t!("Atalhos globais", "Global hotkeys"));
                     for (k, name) in [(0usize, t!("Mutar", "Mute")), (1, "Bypass")] {
@@ -225,8 +232,8 @@ impl Settings {
                     }
 
                     section(ui, t!("Sistema", "System"));
-                    row(ui, "", |ui| {
-                        if ui.checkbox(&mut cfg.app.autostart, t!("Iniciar com o Windows (abre escondido na bandeja)", "Start with Windows (hidden in the tray)")).changed() {
+                    row(ui, t!("Ao ligar o PC", "On PC start"), |ui| {
+                        if ui.checkbox(&mut cfg.app.autostart, t!("Abrir o AMA na bandeja", "Open AMA in the tray")).changed() {
                             out.push(SetEdit::Autostart);
                         }
                     });
@@ -238,7 +245,6 @@ impl Settings {
                             }
                         }
                     });
-
                     row(ui, t!("Idioma", "Language"), |ui| {
                         for (v, name) in [("pt", "Português"), ("en", "English")] {
                             if ui.radio(cfg.app.language == v, name).clicked() && cfg.app.language != v {
@@ -247,16 +253,16 @@ impl Settings {
                             }
                         }
                     });
-
-                    row(ui, "", |ui| {
-                        if ui.checkbox(&mut cfg.app.check_updates, t!("Procurar versão nova ao abrir (pergunta antes de instalar)", "Look for a new version on start (asks before installing)")).changed() {
+                    row(ui, t!("Atualizações", "Updates"), |ui| {
+                        if ui.checkbox(&mut cfg.app.check_updates, t!("Procurar ao abrir", "Check on start")).changed() {
                             out.push(SetEdit::Saved);
                         }
-                    });
+                    })
+                    .on_hover_text(t!("Só instala se você aceitar.", "Only installs if you accept."));
 
                     section(ui, t!("Presets por programa", "Per-program presets"));
-                    row(ui, "", |ui| {
-                        if ui.checkbox(&mut cfg.app.auto_preset, t!("Trocar o preset conforme o programa em foco", "Switch the preset based on the focused program")).changed() {
+                    row(ui, t!("Troca automática", "Auto switch"), |ui| {
+                        if ui.checkbox(&mut cfg.app.auto_preset, t!("Conforme o programa em foco", "Based on the focused program")).changed() {
                             out.push(SetEdit::AutoPreset);
                         }
                     });
@@ -267,7 +273,7 @@ impl Settings {
                     section(ui, t!("Painéis", "Panels"));
                     let a = &mut cfg.app;
                     let mut pc = false;
-                    ui.horizontal_wrapped(|ui| {
+                    row(ui, t!("Mostrar", "Show"), |ui| {
                         pc |= ui.checkbox(&mut a.show_curve, t!("Curva do EQ", "EQ curve")).changed();
                         pc |= ui.checkbox(&mut a.show_spectrum, t!("Espectro", "Spectrum")).changed();
                         pc |= ui.checkbox(&mut a.show_meters, t!("Medidores", "Meters")).changed();
@@ -305,11 +311,10 @@ impl Settings {
                     }
 
                     section(ui, t!("Primeiros passos", "Getting started"));
-                    row(ui, "", |ui| {
-                        if ui.button(t!("Abrir o assistente", "Open the assistant")).clicked() {
+                    row(ui, t!("Assistente", "Assistant"), |ui| {
+                        if ui.button(t!("Abrir", "Open")).on_hover_text(t!("Confere o VB-Cable e o mic, e mede o ruído do ambiente.", "Checks VB-Cable and the mic, and measures room noise.")).clicked() {
                             out.push(SetEdit::Wizard);
                         }
-                        label_muted(ui, t!("Confere o VB-Cable, o mic e mede o ruído do ambiente.", "Checks VB-Cable and the mic, and measures room noise."));
                     });
 
                     section(ui, t!("Sobre", "About"));
