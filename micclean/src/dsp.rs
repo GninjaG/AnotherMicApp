@@ -184,6 +184,10 @@ impl DcBlock {
     }
 }
 
+/// O DfTract usa Rc por dentro. Passa de thread inteiro, sem cópias vivas em outra thread.
+pub struct Moved<T>(pub T);
+unsafe impl<T> Send for Moved<T> {}
+
 pub struct Pipeline {
     pub dc: DcBlock,
     pub aec: Aec,
@@ -304,6 +308,24 @@ impl Pipeline {
             self.ll = ll;
         }
         Ok(())
+    }
+
+    /// Carrega o modelo em outra thread: leva ~1 s e travaria o áudio.
+    pub fn load_model(&self, ll: bool) -> std::sync::mpsc::Receiver<Result<Moved<Dfn>, String>> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (atten, post) = (self.atten, self.post);
+        std::thread::spawn(move || {
+            let _ = tx.send(Dfn::with_model(atten, post, ll).map(Moved));
+        });
+        rx
+    }
+
+    /// Troca pelo modelo já carregado e devolve o antigo (para liberar fora da thread de áudio).
+    pub fn swap_model(&mut self, d: Moved<Dfn>, ll: bool) -> Moved<Dfn> {
+        let mut d = d.0;
+        d.set_atten(self.atten);
+        self.ll = ll;
+        Moved(std::mem::replace(&mut self.dfn, d))
     }
 
     pub fn set_atten(&mut self, db: f32) {

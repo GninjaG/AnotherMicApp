@@ -154,7 +154,7 @@ fn start_app(name: &str, cfg: &mut Config) -> App {
     let _ = std::fs::remove_file(&log);
     let _ = std::fs::remove_file(cfg_path.with_extension("stop"));
     cfg.app.log_file = log.to_string_lossy().into();
-    cfg.app.stats_interval_s = 10;
+    cfg.app.stats_interval_s = std::env::var("AMA_STATS").ok().and_then(|s| s.parse().ok()).unwrap_or(10);
     std::fs::write(&cfg_path, toml::to_string(cfg).unwrap()).unwrap();
     let exe = std::env::current_exe().unwrap().parent().unwrap().join("AMA.exe");
     let child = Command::new(exe).args(["--no-tray", "--config"]).arg(&cfg_path).spawn().expect("AMA.exe");
@@ -328,6 +328,12 @@ fn cmd_latency(out: &str, mic: &str, play_dev: &str) {
         stop.store(true, Relaxed);
         let _ = pl.join();
         let log = app.stop();
+        if std::env::var("AMA_STATS").is_ok() {
+            for l in log.lines().filter(|l| l.contains("stats:")) {
+                let g = |k: &str| l.split(k).nth(1).and_then(|s| s.split([' ', '|']).next()).unwrap_or("-").to_string();
+                println!("    {} underrun={} overrun={} starve={} mic_glitch={} buf={} proc_max={}", &l[11..19], g("out_underrun="), g("out_overrun="), g("out_starve="), g("mic_glitch="), g("buf out="), g("proc_max="));
+            }
+        }
         let (Ok(m), Ok(o)) = (m, o) else {
             println!("  {name}: erro de gravação");
             continue;
@@ -551,6 +557,79 @@ fn cmd_cable(buf_ms: f64, rmode: &str, cmode: &str) {
     println!("  render {rmode} {buf_ms} ms, leitura {cmode}: cliques {} enviados, {} recebidos | atraso até o leitor (ms): {}", played.len(), got.len(), d.join(" "));
 }
 
+/// Ritmo real do CABLE Input (eventos, frames escritos, relógio do dispositivo) contra o QPC e o que sai no CABLE Output.
+fn cmd_xrate(rmode: &str, secs: f64) {
+    let stop = Arc::new(AtomicBool::new(false));
+    let st = stop.clone();
+    let rd = std::thread::spawn(move || -> Res<(usize, f64)> {
+        audio::com_init();
+        let dev = audio::find(Direction::Capture, "CABLE Output")?;
+        let mut c = audio::open_capture(&dev, false, false, 1)?;
+        c.client.start_stream().map_err(|e| e.to_string())?;
+        let (mut n, mut t0) = (0usize, None);
+        while !st.load(Relaxed) {
+            if c.ev.wait_for_event(200).is_err() {
+                continue;
+            }
+            let (k, _) = c.drain(|_| {})?;
+            if t0.is_none() && k > 0 {
+                t0 = Some(Instant::now());
+            } else {
+                n += k;
+            }
+        }
+        Ok((n, t0.map(|t| t.elapsed().as_secs_f64()).unwrap_or(0.0)))
+    });
+    let r = (|| -> Res<String> {
+        audio::com_init();
+        let _mm = audio::mmcss_pro_audio();
+        let dev = audio::find(Direction::Render, "CABLE Input")?;
+        let mut r = if rmode == "excl" { audio::open_render_exclusive(&dev, 2)? } else { audio::open_render_fast(&dev)? };
+        let clock = r.client.get_audioclock().map_err(|e| e.to_string())?;
+        let freq = clock.get_frequency().map_err(|e| e.to_string())? as f64;
+        r.client.start_stream().map_err(|e| e.to_string())?;
+        let t0 = Instant::now();
+        let (mut events, mut written, mut first) = (0u64, 0usize, None);
+        let mut gaps = vec![];
+        let mut last = Instant::now();
+        while t0.elapsed().as_secs_f64() < secs {
+            let _ = r.ev.wait_for_event(500);
+            let now = Instant::now();
+            gaps.push(now.duration_since(last).as_secs_f64() * 1000.0);
+            last = now;
+            events += 1;
+            let n = r.available()?;
+            if first.is_none() {
+                first = Some((Instant::now(), written, clock.get_position().map_err(|e| e.to_string())?.0));
+            }
+            r.write_silence(n)?;
+            written += n;
+        }
+        let (ft, fw, fp) = first.unwrap();
+        let el = ft.elapsed().as_secs_f64();
+        let pos = clock.get_position().map_err(|e| e.to_string())?.0;
+        let _ = r.client.stop_stream();
+        gaps.sort_by(f64::total_cmp);
+        let ppm = |x: f64| (x / el - SR as f64) / SR as f64 * 1e6;
+        Ok(format!(
+            "período {} | eventos {events} | escrito {:+.0} ppm | relógio do dispositivo {:+.0} ppm | intervalo entre eventos ms: mín {:.2} med {:.2} máx {:.2}",
+            r.period,
+            ppm((written - fw) as f64),
+            ppm((pos - fp) as f64 / freq * SR as f64),
+            gaps[1],
+            gaps[gaps.len() / 2],
+            gaps[gaps.len() - 1]
+        ))
+    })();
+    std::thread::sleep(Duration::from_millis(300));
+    stop.store(true, Relaxed);
+    let (n, el) = rd.join().unwrap().unwrap_or((0, 0.0));
+    match r {
+        Ok(s) => println!("  {rmode}: {s} | CABLE Output lido {:+.0} ppm", (n as f64 / el - SR as f64) / SR as f64 * 1e6),
+        Err(e) => println!("  {rmode}: erro {e}"),
+    }
+}
+
 /// Roda o app com AEC e DFN por `secs` e mostra as últimas estatísticas (falhas de buffer).
 fn cmd_soak(out: &str, secs: u64) {
     let mut cfg = base_cfg(out);
@@ -587,6 +666,14 @@ fn main() {
         Some("e2e") => cmd_e2e(&arg(2, out_default), arg(3, "20").parse().unwrap()),
         Some("soak") => cmd_soak(&arg(2, out_default), arg(3, "60").parse().unwrap_or(60)),
         Some("periods") => cmd_periods(),
+        Some("dfndelay") => {
+            for ll in [false, true] {
+                let t = Instant::now();
+                let d = micclean::dsp::Dfn::with_model(100.0, 0.0, ll).unwrap();
+                println!("  ll={ll}: atraso {:.1} ms, carregar {:.0} ms", d.delay() as f64 * 1000.0 / SR as f64, t.elapsed().as_secs_f64() * 1000.0);
+            }
+        }
+        Some("xrate") => cmd_xrate(&arg(2, "excl"), arg(3, "20").parse().unwrap_or(20.0)),
         Some("cable") => cmd_cable(arg(2, "10").parse().unwrap_or(10.0), &arg(3, "shared"), &arg(4, "shared")),
         Some("latency") => cmd_latency(&arg(2, out_default), &arg(3, ""), &arg(4, "")),
         Some("talk") => cmd_talk(&arg(2, "CABLE Input")),

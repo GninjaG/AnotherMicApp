@@ -75,6 +75,7 @@ impl Engine {
                 monp: OutPath::new(out_target_ms(out_ms, ll), RING),
                 out_ms,
                 targets: (out_target_ms(out_ms, ll), out_target_ms(out_ms, ll)),
+                loading: None,
                 ref_cons,
                 out_prod,
                 mon_prod,
@@ -194,6 +195,7 @@ struct Dsp {
     fill: usize,
     out_ms: f64,
     targets: (f64, f64),
+    loading: Option<(bool, std::sync::mpsc::Receiver<Result<crate::dsp::Moved<crate::dsp::Dfn>, String>>)>,
     stats: Arc<Stats>,
 }
 
@@ -215,14 +217,25 @@ impl Dsp {
             self.pipe.apply(c, &mut self.bin_prod);
         }
         let ll = st.low_latency.load(Relaxed);
-        if ll != self.pipe.ll {
-            match self.pipe.set_model(ll) {
-                Ok(()) => log!("modo de baixa latência: {}", if ll { "ligado" } else { "desligado" }),
-                Err(e) => {
+        if let Some((want, rx)) = &self.loading {
+            match rx.try_recv() {
+                Ok(Ok(d)) if *want == ll => {
+                    let old = self.pipe.swap_model(d, ll);
+                    std::thread::spawn(move || drop(old));
+                    log!("modo de baixa latência: {}", if ll { "ligado" } else { "desligado" });
+                    self.loading = None;
+                }
+                Ok(Ok(_)) => self.loading = None,
+                Ok(Err(e)) => {
                     log!("modo de baixa latência: {e}");
                     st.low_latency.store(self.pipe.ll, Relaxed);
+                    self.loading = None;
                 }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(_) => self.loading = None,
             }
+        } else if ll != self.pipe.ll {
+            self.loading = Some((ll, self.pipe.load_model(ll)));
         }
         let ll = self.pipe.ll;
         let t = (out_target_for(self.out_ms, ll, st.out_period.load(Relaxed)), out_target_for(self.out_ms, ll, st.mon_period.load(Relaxed)));
@@ -249,7 +262,7 @@ impl Dsp {
         let t = self.pipe.process(&mut self.frame, &self.refb);
         peak_max(&st.out_peak, &self.frame);
         let ev = self.outp.push(&self.frame, &mut self.out_prod);
-        if ev.overrun {
+        if ev.overrun || ev.dropped {
             inc(&st.out_overruns);
         }
         if st.monitor.load(Relaxed) {

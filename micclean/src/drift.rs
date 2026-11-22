@@ -80,6 +80,8 @@ fn make_resampler(fixed: FixedAsync) -> Async<f32> {
 pub struct PathEvent {
     pub underrun: bool,
     pub overrun: bool,
+    /// Descartou o excesso acima do alvo.
+    pub dropped: bool,
 }
 
 /// Referência: consome do ring (relógio das caixas), entrega FRAME no relógio do mic.
@@ -152,14 +154,23 @@ pub struct OutPath {
     pub target: usize,
     cap: usize,
     max: usize,
+    low: usize,
+    nlow: usize,
+    skip: usize,
 }
+
+/// Pushes (de 10 ms) para medir o menor nível do buffer.
+const LOW_WIN: usize = 10;
+/// Acima do alvo por mais que isso em toda a janela: descarta o excesso em vez de esperar o PI.
+const SLACK: usize = SR / 500;
+const XFADE: usize = 32;
 
 impl OutPath {
     pub fn new(target_ms: f64, ring_capacity: usize) -> Self {
         let rs = make_resampler(FixedAsync::Input);
         let target = (target_ms * SR as f64 / 1000.0) as usize;
         let outbuf = vec![0.0; rs.output_frames_max()];
-        Self { rs, ctl: RateCtl::new(target as f64), outbuf, target, cap: ring_capacity, max: target * 2 + 4 * FRAME }
+        Self { rs, ctl: RateCtl::new(target as f64), outbuf, target, cap: ring_capacity, max: target * 2 + 4 * FRAME, low: usize::MAX, nlow: 0, skip: 0 }
     }
 
     pub fn latency_frames(&self) -> usize {
@@ -170,6 +181,7 @@ impl OutPath {
         self.target = (target_ms * SR as f64 / 1000.0) as usize;
         self.max = self.target * 2 + 4 * FRAME;
         self.ctl.set_target(self.target as f64);
+        (self.low, self.nlow) = (usize::MAX, 0);
     }
 
     pub fn push(&mut self, input: &[f32], prod: &mut Producer<f32>) -> PathEvent {
@@ -181,6 +193,17 @@ impl OutPath {
             ev.overrun = true;
             return ev;
         }
+        // o nível logo antes do push é o ponto mais baixo do ciclo
+        self.low = self.low.min(fill);
+        self.nlow += 1;
+        if self.nlow >= LOW_WIN {
+            if self.low > self.target + SLACK {
+                self.skip = self.low - self.target;
+                self.ctl.reset_level();
+            }
+            self.low = usize::MAX;
+            self.nlow = 0;
+        }
         let r = self.ctl.update(fill as f64);
         let _ = self.rs.set_resample_ratio_relative(r, true);
         let inp = InterleavedSlice::new(&input[..FRAME], 1, FRAME).unwrap();
@@ -190,18 +213,28 @@ impl OutPath {
             Ok((_, n)) => n,
             Err(_) => 0,
         };
+        let d = self.skip.min(n.saturating_sub(2 * XFADE));
+        if d > 0 {
+            for i in 0..XFADE {
+                let g = (i as f32 + 0.5) / XFADE as f32;
+                self.outbuf[d + i] = self.outbuf[i] * (1.0 - g) + self.outbuf[d + i] * g;
+            }
+            self.skip -= d;
+            ev.dropped = true;
+        }
+        let src = &self.outbuf[d..n];
         let space = prod.slots();
-        let w = if n > space {
+        let w = if src.len() > space {
             ev.overrun = true;
             space
         } else {
-            n
+            src.len()
         };
         if let Ok(mut c) = prod.write_chunk(w) {
             let (a, b) = c.as_mut_slices();
             let la = a.len();
-            a.copy_from_slice(&self.outbuf[..la]);
-            b.copy_from_slice(&self.outbuf[la..la + b.len()]);
+            a.copy_from_slice(&src[..la]);
+            b.copy_from_slice(&src[la..la + b.len()]);
             c.commit_all();
         }
         ev
