@@ -1,4 +1,4 @@
-use egui::{Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Margin, Stroke, TextStyle, Visuals};
+use egui::{Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Id, Margin, Rect, Stroke, TextStyle, Visuals};
 use std::sync::Arc;
 
 pub const BG: Color32 = Color32::from_rgb(0x12, 0x0e, 0x12);
@@ -20,6 +20,66 @@ pub const SEMIBOLD: &str = "semibold";
 fn load_font(names: &[&str]) -> Option<Vec<u8>> {
     let dir = std::env::var("WINDIR").unwrap_or_else(|_| r"C:\Windows".into());
     names.iter().find_map(|n| std::fs::read(format!(r"{dir}\Fonts\{n}")).ok())
+}
+
+pub const ANIM_TIME: f32 = 0.2;
+
+pub fn set_animations(ctx: &egui::Context, on: bool) {
+    ctx.global_style_mut(|s| {
+        s.animation_time = if on { ANIM_TIME } else { 0.0 };
+        s.scroll_animation = if on { Default::default() } else { egui::style::ScrollAnimation::none() };
+    });
+}
+
+/// 0 -> 1 na primeira vez que `id` aparece.
+pub fn appear(ctx: &egui::Context, id: Id) -> f32 {
+    let a = id.with("appear");
+    if ctx.data(|d| d.get_temp::<()>(id).is_none()) {
+        ctx.data_mut(|d| d.insert_temp(id, ()));
+        ctx.animate_bool_responsive(a, false);
+    }
+    ctx.animate_bool_responsive(a, true)
+}
+
+/// Esmaece a entrada do conteúdo quando `key` muda.
+pub fn fade_on_change(ui: &mut egui::Ui, id: Id, key: u64) {
+    let now = ui.input(|i| i.time);
+    let at = ui.data_mut(|d| {
+        let e = d.get_temp_mut_or_insert_with(id, || (key, f64::NEG_INFINITY));
+        if e.0 != key {
+            *e = (key, now);
+        }
+        e.1
+    });
+    let dur = ui.ctx().global_style().animation_time;
+    if dur > 0.0 {
+        let t = ((now - at) as f32 / dur).clamp(0.0, 1.0);
+        if t < 1.0 {
+            ui.multiply_opacity(egui::emath::easing::cubic_out(t));
+            ui.ctx().request_repaint();
+        }
+    }
+}
+
+/// Mostra o conteúdo abrindo e fechando a altura aos poucos.
+pub fn reveal<R>(ui: &mut egui::Ui, id: Id, open: bool, add: impl FnOnce(&mut egui::Ui) -> R) -> Option<R> {
+    let t = ui.ctx().animate_bool_responsive(id, open);
+    if t <= 0.0 {
+        return None;
+    }
+    let avail = ui.available_rect_before_wrap();
+    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(avail).layout(*ui.layout()));
+    if t < 1.0 {
+        let full: f32 = ui.data(|d| d.get_temp(id.with("h"))).unwrap_or(avail.height());
+        let clip = Rect::from_min_size(avail.min - egui::vec2(4.0, 0.0), egui::vec2(avail.width() + 8.0, full * t));
+        child.set_clip_rect(child.clip_rect().intersect(clip));
+        child.multiply_opacity(t);
+    }
+    let r = add(&mut child);
+    let m = child.min_rect();
+    ui.data_mut(|d| d.insert_temp(id.with("h"), m.height()));
+    ui.allocate_rect(Rect::from_min_size(m.min, egui::vec2(m.width(), m.height() * t)), egui::Sense::hover());
+    Some(r)
 }
 
 pub fn install(ctx: &egui::Context) {
@@ -103,6 +163,7 @@ pub fn install(ctx: &egui::Context) {
     w.active.expansion = 0.0;
     w.open = w.hovered;
     st.visuals = v;
+    st.animation_time = ANIM_TIME;
     ctx.set_global_style(st);
 }
 
@@ -123,6 +184,11 @@ pub fn toggle(ui: &mut egui::Ui, on: &mut bool) -> egui::Response {
     resp
 }
 
+/// Cor que acompanha o hover aos poucos.
+pub fn hover_col(ui: &egui::Ui, r: &egui::Response, off: Color32, on: Color32) -> Color32 {
+    lerp(off, on, ui.ctx().animate_bool_responsive(r.id.with("hover"), r.hovered() || r.dragged()))
+}
+
 pub fn lerp(a: Color32, b: Color32, t: f32) -> Color32 {
     let f = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
     Color32::from_rgb(f(a.r(), b.r()), f(a.g(), b.g()), f(a.b(), b.b()))
@@ -134,19 +200,25 @@ pub fn semibold(size: f32) -> FontId {
 
 /// Botão de estado (Mutar, Bypass, Escuta): preenchido quando ativo.
 pub fn pill(ui: &mut egui::Ui, label: &str, on: bool, color: Color32) -> egui::Response {
-    let txt = egui::RichText::new(label).font(semibold(13.5)).color(if on { Color32::WHITE } else { TEXT });
+    let t = ui.ctx().animate_bool_responsive(ui.scope_id().with(("pill", label)), on);
+    let txt = egui::RichText::new(label).font(semibold(13.5)).color(lerp(TEXT, Color32::WHITE, t));
     let b = egui::Button::new(txt)
-        .fill(if on { color } else { Color32::from_rgb(0x2a, 0x22, 0x2a) })
+        .fill(lerp(Color32::from_rgb(0x2a, 0x22, 0x2a), color, t))
         .corner_radius(CornerRadius::same(15))
         .min_size(egui::vec2(0.0, 30.0));
     ui.add(b)
 }
 
 pub fn card_frame(hi: bool) -> egui::Frame {
+    card_frame_t(if hi { 1.0 } else { 0.0 })
+}
+
+/// `t`: 0 normal, 1 selecionado.
+pub fn card_frame_t(t: f32) -> egui::Frame {
     egui::Frame::new()
-        .fill(if hi { CARD_HI } else { CARD })
+        .fill(lerp(CARD, CARD_HI, t))
         .corner_radius(CornerRadius::same(10))
-        .stroke(Stroke::new(1.0, if hi { Color32::from_rgb(0x45, 0x37, 0x43) } else { LINE }))
+        .stroke(Stroke::new(1.0, lerp(LINE, Color32::from_rgb(0x45, 0x37, 0x43), t)))
         .inner_margin(Margin { left: 12, right: 12, top: 10, bottom: 10 })
 }
 

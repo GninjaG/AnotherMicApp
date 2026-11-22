@@ -70,7 +70,7 @@ pub fn file_stem(p: &str) -> String {
 
 fn grip(ui: &mut egui::Ui) -> egui::Response {
     let (r, resp) = ui.allocate_exact_size(vec2(12.0, 22.0), Sense::drag());
-    let c = if resp.hovered() || resp.dragged() { TEXT } else { FAINT };
+    let c = hover_col(ui, &resp, FAINT, TEXT);
     for row in 0..3 {
         for col in 0..2 {
             ui.painter().circle_filled(pos2(r.left() + 3.0 + col as f32 * 5.0, r.center().y - 5.0 + row as f32 * 5.0), 1.3, c);
@@ -85,7 +85,7 @@ fn grip(ui: &mut egui::Ui) -> egui::Response {
 fn chevron(ui: &mut egui::Ui, open: bool) -> egui::Response {
     let (r, resp) = ui.allocate_exact_size(vec2(22.0, 22.0), Sense::click());
     let t = ui.ctx().animate_bool_responsive(resp.id, open);
-    let c = if resp.hovered() { TEXT } else { MUTED };
+    let c = hover_col(ui, &resp, MUTED, TEXT);
     let ctr = r.center();
     let a = std::f32::consts::FRAC_PI_2 * t;
     let rot = |x: f32, y: f32| pos2(ctr.x + x * a.cos() - y * a.sin(), ctr.y + x * a.sin() + y * a.cos());
@@ -99,7 +99,7 @@ fn close_x(ui: &mut egui::Ui, armed: bool) -> egui::Response {
         return ui.add(b);
     }
     let (r, resp) = ui.allocate_exact_size(vec2(22.0, 22.0), Sense::click());
-    let c = if resp.hovered() { ERR } else { FAINT };
+    let c = hover_col(ui, &resp, FAINT, ERR);
     let k = 4.0;
     let p = ui.painter();
     p.line_segment([r.center() + vec2(-k, -k), r.center() + vec2(k, k)], Stroke::new(1.5, c));
@@ -123,12 +123,15 @@ impl Cards {
             let id = blocks[i].id;
             let open = self.open.contains(&id);
             let failed = cx.errs.contains_key(&id) || cx.vst.get(&id).is_some_and(|p| p.failed.load(Relaxed));
-            let hi = cx.sel == Some(id);
-            let mut frame = card_frame(hi);
+            let hi = ui.ctx().animate_bool_responsive(ui.scope_id().with(("card-hi", id)), cx.sel == Some(id));
+            let mut frame = card_frame_t(hi);
             if failed {
                 frame = frame.stroke(Stroke::new(1.0, ERR));
             }
-            let fr = frame.show(ui, |ui| {
+            let a = appear(ui.ctx(), ui.scope_id().with(("card-in", id)));
+            let fr = ui.scope(|ui| {
+                ui.multiply_opacity(a);
+                frame.show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
                     let g = grip(ui);
@@ -198,7 +201,9 @@ impl Cards {
                         }
                     });
                 }
-            });
+                })
+            })
+            .inner;
             let resp = ui.interact(fr.response.rect, ui.scope_id().with(("card", id)), Sense::hover());
             if fr.response.clicked() {
                 edits.push(Edit::Select(id));
@@ -252,15 +257,29 @@ fn seg(ui: &mut egui::Ui, items: &[&str], cur: usize) -> Option<usize> {
     egui::Frame::new().fill(BG).corner_radius(8).inner_margin(3).show(ui, |ui| {
         ui.spacing_mut().item_spacing.x = 2.0;
         ui.horizontal(|ui| {
+            let base = ui.scope_id().with("seg");
+            let bg = ui.painter().add(egui::Shape::Noop);
+            let x0 = ui.max_rect().left();
+            let mut rects = vec![];
             for (k, it) in items.iter().enumerate() {
                 let on = k == cur;
-                let b = egui::Button::new(RichText::new(*it).size(12.5).color(if on { Color32::WHITE } else { MUTED }))
-                    .fill(if on { ACCENT_DIM } else { Color32::TRANSPARENT })
+                let t = ui.ctx().animate_bool_responsive(base.with(k), on);
+                let b = egui::Button::new(RichText::new(*it).size(12.5).color(lerp(MUTED, Color32::WHITE, t)))
+                    .fill(Color32::TRANSPARENT)
                     .corner_radius(6)
                     .min_size(vec2(0.0, 24.0));
-                if ui.add(b).clicked() && !on {
+                let r = ui.add(b);
+                if r.clicked() && !on {
                     out = Some(k);
                 }
+                rects.push(r.rect);
+            }
+            if let Some(r) = rects.get(cur) {
+                let ctx = ui.ctx();
+                let tm = ctx.global_style().animation_time;
+                let l = x0 + ctx.animate_value_with_time(base.with("l"), r.left() - x0, tm);
+                let rt = x0 + ctx.animate_value_with_time(base.with("r"), r.right() - x0, tm);
+                ui.painter().set(bg, egui::Shape::rect_filled(Rect::from_x_y_ranges(l..=rt, r.y_range()), 6, ACCENT_DIM));
             }
         });
     });

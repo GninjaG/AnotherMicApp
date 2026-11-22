@@ -68,6 +68,7 @@ impl Wizard {
                 });
             });
             ui.add_space(8.0);
+            fade_on_change(ui, egui::Id::unique("wiz-step"), self.step as u64);
             match self.step {
                 0 => self.step_cable(ui, current_mic),
                 1 => self.step_mic(ui, out),

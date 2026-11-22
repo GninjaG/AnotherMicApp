@@ -99,6 +99,8 @@ pub struct App {
     pub setup_pending: bool,
     /// Procura versão nova nos releases do GitHub ao abrir.
     pub check_updates: bool,
+    /// Transições suaves na interface.
+    pub animations: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -181,6 +183,7 @@ impl Default for App {
             program_presets: vec![],
             setup_pending: false,
             check_updates: true,
+            animations: true,
         }
     }
 }

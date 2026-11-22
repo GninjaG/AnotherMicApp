@@ -137,6 +137,7 @@ pub struct Boot {
 impl AmaApp {
     pub fn new(cc: &eframe::CreationContext, b: Boot) -> AmaApp {
         install(&cc.egui_ctx);
+        set_animations(&cc.egui_ctx, b.cfg.app.animations);
         let hwnd = sys::hwnd_of(cc).unwrap_or(0);
         sys::dark_title(hwnd);
         let mut sys = Sys::new(&cc.egui_ctx);
@@ -779,6 +780,7 @@ impl AmaApp {
         let avail = ui.available_height() - 46.0;
         let mut edits = vec![];
         egui::ScrollArea::vertical().max_height(avail).auto_shrink([false, false]).show(ui, |ui| {
+            fade_on_change(ui, egui::Id::unique("chain-fade"), egui::Id::unique(&self.preset.name).value());
             ui.spacing_mut().item_spacing.y = 8.0;
             let meters = self.block_meters();
             let cx = cards::Ctx { errs: &self.errs, vst: &self.vst, sel: self.sel, vol_db: self.shared.vol_db.get(), meters: &meters };
@@ -841,12 +843,19 @@ impl AmaApp {
     fn right_panel(&mut self, ui: &mut egui::Ui) {
         let a = &self.cfg.app;
         let (curve, specv, meters, status) = (a.show_curve, a.show_spectrum, a.show_meters, a.show_status);
-        if curve || specv {
-            let h_extra = if meters { 92.0 } else { 0.0 } + if status { 178.0 } else { 0.0 };
-            let h = (ui.available_height() - h_extra - 16.0).max(220.0);
-            let bypass = self.st().bypass.load(Relaxed);
-            let spec = specv.then_some(&self.spec);
-            let edits = self.graph.show(ui, &mut self.preset.blocks, self.sel, self.shared.vol_db.get(), spec, curve, bypass, h);
+        let ctx = ui.ctx().clone();
+        let tm = ctx.animate_bool_responsive(egui::Id::unique("pan-meters-h"), meters);
+        let ts = ctx.animate_bool_responsive(egui::Id::unique("pan-status-h"), status);
+        let h_extra = 92.0 * tm + 178.0 * ts;
+        let h = (ui.available_height() - h_extra - 16.0).max(220.0);
+        let bypass = self.st().bypass.load(Relaxed);
+        let spec = specv.then_some(&self.spec);
+        let graph_edits = reveal(ui, egui::Id::unique("pan-graph"), curve || specv, |ui| {
+            let e = self.graph.show(ui, &mut self.preset.blocks, self.sel, self.shared.vol_db.get(), spec, curve, bypass, h);
+            ui.add_space(8.0);
+            e
+        });
+        if let Some(edits) = graph_edits {
             for e in edits {
                 match e {
                     GraphEdit::Filter(id) => self.live(id),
@@ -857,26 +866,25 @@ impl AmaApp {
                     }
                 }
             }
-            ui.add_space(8.0);
         }
-        if meters {
+        reveal(ui, egui::Id::unique("pan-meters"), meters, |ui| {
             card_frame(false).show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 self.m_in.show(ui, t!("Entrada", "Input"));
                 self.m_out.show(ui, t!("Saída", "Output"));
             });
             ui.add_space(8.0);
-        }
-        if status {
+        });
+        reveal(ui, egui::Id::unique("pan-status"), status, |ui| {
             card_frame(false).show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 self.status(ui);
             });
-        }
-        if !(curve || specv || meters || status) {
+        });
+        reveal(ui, egui::Id::unique("pan-none"), !(curve || specv || meters || status), |ui| {
             ui.add_space(80.0);
             ui.vertical_centered(|ui| label_muted(ui, t!("Painéis ocultos. Ative em Ajustes.", "Panels hidden. Turn them on in Settings.")));
-        }
+        });
     }
 
     fn status(&self, ui: &mut egui::Ui) {
@@ -884,7 +892,9 @@ impl AmaApp {
         let dot = |ui: &mut egui::Ui, ok: bool, idle: bool, name: &str, dev: &str| {
             ui.horizontal(|ui| {
                 let (r, _) = ui.allocate_exact_size(vec2(10.0, 16.0), egui::Sense::hover());
-                let c = if idle { FAINT } else if ok { OK } else { ERR };
+                let id = egui::Id::unique(("dot", name));
+                let (to, ti) = (ui.ctx().animate_bool_responsive(id.with("ok"), ok), ui.ctx().animate_bool_responsive(id.with("idle"), idle));
+                let c = lerp(lerp(ERR, OK, to), FAINT, ti);
                 ui.painter().circle_filled(r.center(), 4.0, c);
                 ui.label(RichText::new(name).size(13.0));
                 let d = if dev.is_empty() { t!("padrão do Windows", "Windows default") } else { dev };
@@ -1029,11 +1039,15 @@ impl AmaApp {
         }
 
         if let Some((t, at, err)) = &self.toast {
-            if self.last_t - at > 4.0 {
+            let age = (self.last_t - at) as f32;
+            if age > 4.0 {
                 self.toast = None;
             } else {
                 let (t, err) = (t.clone(), *err);
-                egui::Area::new(egui::Id::unique("toast")).anchor(egui::Align2::CENTER_BOTTOM, vec2(0.0, -18.0)).order(egui::Order::Foreground).show(ctx, |ui| {
+                let dur = ctx.global_style().animation_time;
+                let k = if dur > 0.0 { egui::emath::easing::cubic_out(((4.0 - age) / (dur * 1.5)).min(age / dur).clamp(0.0, 1.0)) } else { 1.0 };
+                egui::Area::new(egui::Id::unique("toast")).anchor(egui::Align2::CENTER_BOTTOM, vec2(0.0, -18.0 + 10.0 * (1.0 - k))).order(egui::Order::Foreground).show(ctx, |ui| {
+                    ui.multiply_opacity(k);
                     egui::Frame::new()
                         .fill(CARD_HI)
                         .stroke(Stroke::new(1.0, if err { ERR } else { LINE }))
@@ -1117,6 +1131,7 @@ impl AmaApp {
                     self.sys.set_language();
                     self.apply_hotkeys();
                 }
+                SetEdit::Animations => set_animations(ctx, self.cfg.app.animations),
                 SetEdit::Saved => {}
             }
         }
@@ -1223,12 +1238,11 @@ impl eframe::App for AmaApp {
             self.m_out.feed(po, self.last_t, dt);
         }
 
-        if !matches!(self.upd, Upd::None) {
-            egui::Panel::top("update")
-                .frame(egui::Frame::new().fill(CARD_HI).inner_margin(egui::Margin { left: 18, right: 18, top: 8, bottom: 8 }))
-                .show_separator_line(false)
-                .show(ui, |ui| self.update_bar(ui));
-        }
+        let mut upd_open = !matches!(self.upd, Upd::None);
+        egui::Panel::top("update")
+            .frame(egui::Frame::new().fill(CARD_HI).inner_margin(egui::Margin { left: 18, right: 18, top: 8, bottom: 8 }))
+            .show_separator_line(false)
+            .show_collapsible(ui, &mut upd_open, |ui| self.update_bar(ui));
         egui::Panel::top("top")
             .frame(egui::Frame::new().fill(PANEL).inner_margin(egui::Margin { left: 18, right: 18, top: 12, bottom: 12 }))
             .show_separator_line(false)

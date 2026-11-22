@@ -27,6 +27,7 @@ pub enum SetEdit {
     LowLatency,
     AutoPreset,
     Wizard,
+    Animations,
     Saved,
 }
 
@@ -135,6 +136,9 @@ impl Settings {
         let mut out = vec![];
         if !self.open {
             self.capture = None;
+        }
+        // continua desenhando enquanto a janela esmaece ao fechar
+        if ctx.animate_bool_responsive(egui::Id::unique("settings-vis"), self.open) <= 0.0 {
             return out;
         }
         if !self.loaded || self.seen != audio::hotplug() {
@@ -272,7 +276,8 @@ impl Settings {
                             out.push(SetEdit::AutoPreset);
                         }
                     });
-                    if cfg.app.auto_preset && self.program_rules(ui, cfg, presets) {
+                    let auto = cfg.app.auto_preset;
+                    if reveal(ui, egui::Id::unique("set-rules"), auto, |ui| self.program_rules(ui, cfg, presets)) == Some(true) {
                         out.push(SetEdit::Saved);
                     }
 
@@ -288,6 +293,11 @@ impl Settings {
                     if pc {
                         out.push(SetEdit::Saved);
                     }
+                    row(ui, t!("Animações", "Animations"), |ui| {
+                        if ui.checkbox(&mut cfg.app.animations, t!("Transições suaves", "Smooth transitions")).changed() {
+                            out.push(SetEdit::Animations);
+                        }
+                    });
 
                     section(ui, t!("Pastas de plugins VST", "VST plugin folders"));
                     let mut del = None;
