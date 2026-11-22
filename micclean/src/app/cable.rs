@@ -37,14 +37,49 @@ fn run(cmd: &str, args: &[&str]) -> Result<i32, String> {
     Ok(s.code().unwrap_or(-1))
 }
 
+fn backups() -> std::path::PathBuf {
+    let dir = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.join("backups"))).unwrap_or_else(|| "backups".into());
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
+fn note(s: &str) {
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(backups().join("vbcable.log")) {
+        let _ = writeln!(f, "{} {s}", super::presets::chrono_stamp());
+    }
+}
+
+fn restart_device() -> i32 {
+    let Some(id) = read_sz(w!(r"SYSTEM\CurrentControlSet\Services\VBAudioVACMME\Enum"), w!("0")) else {
+        note("instância do VB-Cable não encontrada");
+        return 2;
+    };
+    let r = run("pnputil", &["/restart-device", &id]);
+    note(&format!("pnputil /restart-device {id}: {r:?}"));
+    if r == Ok(0) { 0 } else { 2 }
+}
+
+/// Para o áudio do Windows (que segura o driver), reinicia o VB-Cable e liga de novo.
+fn force_restart() -> i32 {
+    note(&format!("parar AudioEndpointBuilder: {:?}", run("net", &["stop", "AudioEndpointBuilder", "/y"])));
+    let r = restart_device();
+    for svc in ["AudioEndpointBuilder", "Audiosrv"] {
+        note(&format!("iniciar {svc}: {:?}", run("net", &["start", svc])));
+    }
+    r
+}
+
 /// Roda no processo elevado. 0 = aplicado, 2 = gravado mas precisa reiniciar o PC, 1 = erro.
 pub fn elevated_main(n: &str) -> i32 {
+    if n == "force" {
+        return force_restart();
+    }
     let Ok(n) = n.parse::<u32>() else { return 1 };
     if !CHOICES.contains(&n) {
         return 1;
     }
-    let dir = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.join("backups"))).unwrap_or_else(|| "backups".into());
-    let _ = std::fs::create_dir_all(&dir);
+    let dir = backups();
     let bak = dir.join(format!("vbcable-{}.reg", super::presets::chrono_stamp()));
     if run("reg", &["export", r"HKLM\SOFTWARE\VB-Audio\Cable", &bak.to_string_lossy(), "/y"]) != Ok(0) {
         return 1;
@@ -53,20 +88,17 @@ pub fn elevated_main(n: &str) -> i32 {
     if r != ERROR_SUCCESS {
         return 1;
     }
-    let Some(id) = read_sz(w!(r"SYSTEM\CurrentControlSet\Services\VBAudioVACMME\Enum"), w!("0")) else { return 2 };
-    match run("pnputil", &["/restart-device", &id]) {
-        Ok(0) => 0,
-        _ => 2,
-    }
+    note(&format!("latência {n} gravada"));
+    restart_device()
 }
 
 /// Abre o aviso do Windows e espera o processo elevado.
-fn apply(n: u32) -> Result<i32, String> {
+fn apply(arg: String) -> Result<i32, String> {
     use windows::Win32::System::Threading::{GetExitCodeProcess, INFINITE, WaitForSingleObject};
     use windows::Win32::UI::Shell::*;
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let file = HSTRING::from(exe.as_os_str());
-    let params = HSTRING::from(format!("{ARG} {n}"));
+    let params = HSTRING::from(format!("{ARG} {arg}"));
     let mut info = SHELLEXECUTEINFOW {
         cbSize: size_of::<SHELLEXECUTEINFOW>() as u32,
         fMask: SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC,
@@ -95,6 +127,7 @@ pub struct CableUi {
     loaded: bool,
     busy: Option<Receiver<Result<i32, String>>>,
     msg: Option<(String, bool)>,
+    reboot: bool,
 }
 
 fn ms(samples: u32, sr: u32) -> f32 {
@@ -115,6 +148,7 @@ impl CableUi {
                 Ok(r) => {
                     self.busy = None;
                     self.cur = read();
+                    self.reboot = r == Ok(2);
                     self.msg = Some(match r {
                         Ok(0) => (t!("Pronto. O VB-Cable reiniciou com o buffer novo.", "Done. VB-Cable restarted with the new buffer.").into(), false),
                         Ok(2) => (t!("Gravado. Reinicie o PC para valer.", "Saved. Restart the PC for it to apply.").into(), false),
@@ -144,16 +178,8 @@ impl CableUi {
             });
             if self.busy.is_some() {
                 ui.spinner();
-            } else if ui.add_enabled(self.pick != cur, egui::Button::new(t!("Aplicar", "Apply"))).on_hover_text(t!("O Windows vai pedir permissão de administrador. O valor antigo fica salvo em backups.", "Windows will ask for administrator permission. The old value is saved in backups.")).clicked() {
-                let (tx, rx) = std::sync::mpsc::channel();
-                let n = self.pick;
-                let c = ui.ctx().clone();
-                std::thread::spawn(move || {
-                    let _ = tx.send(apply(n));
-                    c.request_repaint();
-                });
-                self.busy = Some(rx);
-                self.msg = None;
+            } else if ui.button(t!("Aplicar", "Apply")).on_hover_text(t!("O Windows vai pedir permissão de administrador. O valor antigo fica salvo em backups.", "Windows will ask for administrator permission. The old value is saved in backups.")).clicked() {
+                self.start(ui.ctx(), self.pick.to_string());
             }
         });
         let now = tr!("Agora: {cur} amostras ({:.0} ms)", "Now: {cur} samples ({:.0} ms)", ms(cur, sr));
@@ -163,6 +189,24 @@ impl CableUi {
             }
             None => label_muted(ui, &now),
         }
+        if self.reboot && self.busy.is_none() {
+            if ui.button(t!("Forçar agora", "Force it now")).on_hover_text(t!("Para o áudio do Windows por alguns segundos para reiniciar o VB-Cable. Todo o som do PC corta, e alguns jogos ficam sem som até serem reabertos.", "Stops Windows audio for a few seconds to restart VB-Cable. All PC sound cuts out, and some games stay silent until reopened.")).clicked() {
+                self.start(ui.ctx(), "force".into());
+            }
+            label_muted(ui, t!("Corta todo o som do PC por alguns segundos.", "Cuts all PC sound for a few seconds."));
+        }
         true
+    }
+
+    fn start(&mut self, ctx: &egui::Context, arg: String) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let c = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(apply(arg));
+            c.request_repaint();
+        });
+        self.busy = Some(rx);
+        self.msg = None;
+        self.reboot = false;
     }
 }
