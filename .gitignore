@@ -1,0 +1,35 @@
+# notas e prompts pessoais
+decisões.mk
+prompt-claude-code-mic-aec.md
+.claude/
+CLAUDE.md
+CLAUDE.local.md
+
+# build
+/micclean/target/
+micclean/target_test_out/
+
+# pasta de uso: exe, ama.toml com seus dispositivos, presets, logs e gravações da sua voz
+micclean/dist/
+
+# configs e logs locais em qualquer lugar
+ama.toml
+config.toml
+micclean/.cargo/
+micclean.toml
+*.log
+*.stop
+
+# backups e lixo
+*.bak-*
+*.bak
+micclean/_to_delete/
+.gitignore.bak-*
+
+# sistema e editores
+Thumbs.db
+desktop.ini
+.DS_Store
+.vscode/
+.idea/
+*.swp
