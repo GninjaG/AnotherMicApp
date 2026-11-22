@@ -90,6 +90,8 @@ pub struct Render {
     pub channels: usize,
     pub name: String,
     pub buffer_frames: u32,
+    /// Período do motor de áudio para este stream, em frames.
+    pub period: u32,
     buf: Vec<f32>,
 }
 
@@ -184,7 +186,8 @@ pub fn open_render(dev: &Device, channels: usize, buffer_hns: Option<i64>) -> Re
     let ev = client.set_get_eventhandle().map_err(e)?;
     let rend = client.get_audiorenderclient().map_err(e)?;
     let buffer_frames = client.get_buffer_size().map_err(e)?;
-    crate::log!("render aberto: '{name}' buffer={buffer_frames}");
+    let period = (client.get_device_period().map_err(e)?.0 * crate::SR as i64 / 10_000_000) as u32;
+    crate::log!("render aberto: '{name}' buffer={buffer_frames} período={period}");
     Ok(Render {
         client,
         rend,
@@ -192,8 +195,31 @@ pub fn open_render(dev: &Device, channels: usize, buffer_hns: Option<i64>) -> Re
         channels,
         name,
         buffer_frames,
+        period,
         buf: vec![0.0; buffer_frames as usize * channels],
     })
+}
+
+/// Render com o menor período que o motor aceitar (IAudioClient3). Só no formato nativo de 48 kHz float.
+pub fn open_render_fast(dev: &Device) -> Res<Render> {
+    let name = dev.get_friendlyname().unwrap_or_default();
+    let mut client = dev.get_iaudioclient().map_err(e)?;
+    let f = client.get_mixformat().map_err(e)?;
+    if f.get_samplespersec() != crate::SR as u32 || f.get_bitspersample() != 32 || f.get_subformat().map_err(e)? != SampleType::Float {
+        return Err(format!("'{name}' não está em 48 kHz float"));
+    }
+    let p = client.get_shared_mode_engine_period(&f).map_err(e)?;
+    if p.min >= p.default {
+        return Err(format!("'{name}' não aceita período menor"));
+    }
+    let period = p.min.max(96).div_ceil(p.fundamental.max(1)) * p.fundamental.max(1);
+    client.initialize_shared_audio_stream(&f, TimingMode::Events, period).map_err(e)?;
+    let ev = client.set_get_eventhandle().map_err(e)?;
+    let rend = client.get_audiorenderclient().map_err(e)?;
+    let buffer_frames = client.get_buffer_size().map_err(e)?;
+    let channels = f.get_nchannels() as usize;
+    crate::log!("render rápido: '{name}' buffer={buffer_frames} período={period} ({:.2} ms)", period as f64 * 1000.0 / crate::SR as f64);
+    Ok(Render { client, rend, ev, channels, name, buffer_frames, period, buf: vec![0.0; buffer_frames as usize * channels] })
 }
 
 impl Render {

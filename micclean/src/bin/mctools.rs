@@ -201,6 +201,7 @@ fn base_cfg(out: &str) -> Config {
     let mut c = Config::default();
     c.devices.output = out.into();
     c.devices.speakers = "Speaker Out".into();
+    c.app.low_latency = std::env::var("AMA_LL").is_ok();
     c
 }
 
@@ -473,6 +474,104 @@ fn cmd_longtest(out: &str, minutes: f64, play: bool) {
     }
 }
 
+/// Atraso só do VB-Cable: clique escrito no CABLE Input até chegar a quem lê o CABLE Output (relógio Instant).
+fn cmd_cable(buf_ms: f64) {
+    let t0 = Instant::now();
+    let stop = Arc::new(AtomicBool::new(false));
+    let st = stop.clone();
+    let rd = std::thread::spawn(move || -> Res<Vec<f64>> {
+        audio::com_init();
+        let _mm = audio::mmcss_pro_audio();
+        let dev = audio::find(Direction::Capture, "CABLE Output")?;
+        let mut c = audio::open_capture(&dev, false, false, 1)?;
+        c.client.start_stream().map_err(|e| e.to_string())?;
+        let mut ev = vec![];
+        let mut last = -1.0f64;
+        while !st.load(Relaxed) {
+            if c.ev.wait_for_event(200).is_err() {
+                continue;
+            }
+            let now = t0.elapsed().as_secs_f64();
+            let mut chunk = vec![];
+            c.drain(|x| chunk.extend_from_slice(x))?;
+            if let Some(i) = chunk.iter().position(|v| v.abs() > 0.3) {
+                let t = now - (chunk.len() - i) as f64 / SR as f64;
+                if t - last > 0.5 {
+                    ev.push(t);
+                    last = t;
+                }
+            }
+        }
+        Ok(ev)
+    });
+    std::thread::sleep(Duration::from_millis(300));
+    let hns = (buf_ms * 1e4) as i64;
+    let mut played = vec![];
+    let r = (|| -> Res<()> {
+        audio::com_init();
+        let _mm = audio::mmcss_pro_audio();
+        let dev = audio::find(Direction::Render, "CABLE Input")?;
+        let mut r = audio::open_render(&dev, 2, Some(hns))?;
+        let bf = r.buffer_frames as usize;
+        r.client.start_stream().map_err(|e| e.to_string())?;
+        let mut pos = 0usize;
+        while pos < 6 * SR {
+            let _ = r.ev.wait_for_event(500);
+            let n = r.available()?;
+            let queued = bf - n;
+            let now = t0.elapsed().as_secs_f64();
+            let v: Vec<f32> = (0..n)
+                .map(|i| {
+                    let p = pos + i;
+                    if p >= SR && p % SR < 48 { 0.8 * if p % 2 == 0 { 1.0 } else { -1.0 } } else { 0.0 }
+                })
+                .collect();
+            if let Some(i) = v.iter().position(|x| x.abs() > 0.0) {
+                played.push(now + (queued + i) as f64 / SR as f64);
+            }
+            pos += n;
+            r.write_mono(&v)?;
+        }
+        std::thread::sleep(Duration::from_millis(1500));
+        Ok(())
+    })();
+    stop.store(true, Relaxed);
+    let got = rd.join().unwrap();
+    if let Err(e) = r {
+        println!("  erro: {e}");
+    }
+    let got = got.unwrap_or_default();
+    let d: Vec<String> = played.iter().filter_map(|&t| got.iter().find(|&&u| u > t - 0.05 && u < t + 0.9).map(|u| format!("{:.1}", (u - t) * 1000.0))).collect();
+    println!("  render {buf_ms} ms: cliques {} enviados, {} recebidos | atraso até o leitor (ms): {}", played.len(), got.len(), d.join(" "));
+}
+
+/// Roda o app com AEC e DFN por `secs` e mostra as últimas estatísticas (falhas de buffer).
+fn cmd_soak(out: &str, secs: u64) {
+    let mut cfg = base_cfg(out);
+    let app = start_app("soak", &mut cfg);
+    std::thread::sleep(Duration::from_secs(secs));
+    let log = app.stop();
+    for l in log.lines().filter(|l| l.contains("stats:")).last() {
+        println!("  {}", l.split("stats: ").nth(1).unwrap_or(l));
+    }
+}
+
+fn cmd_periods() {
+    audio::com_init();
+    for dir in [Direction::Capture, Direction::Render] {
+        for d in audio::list(dir).unwrap_or_default() {
+            let Ok(dev) = audio::find(dir, &d.name) else { continue };
+            let Ok(c) = dev.get_iaudioclient() else { continue };
+            let Ok(f) = c.get_mixformat() else { continue };
+            let p = c.get_shared_mode_engine_period(&f);
+            let (def, min) = c.get_device_period().unwrap_or((0, 0));
+            println!("{dir:?} {:<50} {} Hz {} ch {}-bit | período padrão {:.2} ms mín {:.2} ms | IAudioClient3: {:?}",
+                d.name, f.get_samplespersec(), f.get_nchannels(), f.get_bitspersample(), def as f64 / 1e4, min as f64 / 1e4,
+                p.map(|p| format!("padrão {} mín {} máx {} passo {} frames", p.default, p.min, p.max, p.fundamental)));
+        }
+    }
+}
+
 fn main() {
     let a: Vec<String> = std::env::args().collect();
     let arg = |i: usize, d: &str| a.get(i).cloned().unwrap_or_else(|| d.to_string());
@@ -480,6 +579,9 @@ fn main() {
     match a.get(1).map(|s| s.as_str()) {
         Some("list") => cmd_list(),
         Some("e2e") => cmd_e2e(&arg(2, out_default), arg(3, "20").parse().unwrap()),
+        Some("soak") => cmd_soak(&arg(2, out_default), arg(3, "60").parse().unwrap_or(60)),
+        Some("periods") => cmd_periods(),
+        Some("cable") => cmd_cable(arg(2, "10").parse().unwrap_or(10.0)),
         Some("latency") => cmd_latency(&arg(2, out_default), &arg(3, ""), &arg(4, "")),
         Some("talk") => cmd_talk(&arg(2, "CABLE Input")),
         Some("longtest") => cmd_longtest(&arg(2, out_default), arg(3, "30").parse().unwrap(), arg(4, "play") == "play"),

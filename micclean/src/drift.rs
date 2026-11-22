@@ -46,6 +46,11 @@ impl RateCtl {
         self.ratio
     }
 
+    pub fn set_target(&mut self, frames: f64) {
+        self.target = frames;
+        self.integ = 0.0;
+    }
+
     pub fn reset_level(&mut self) {
         self.ema = None;
     }
@@ -161,6 +166,12 @@ impl OutPath {
         self.target + self.rs.output_delay()
     }
 
+    pub fn set_target(&mut self, target_ms: f64) {
+        self.target = (target_ms * SR as f64 / 1000.0) as usize;
+        self.max = self.target * 2 + 4 * FRAME;
+        self.ctl.set_target(self.target as f64);
+    }
+
     pub fn push(&mut self, input: &[f32], prod: &mut Producer<f32>) -> PathEvent {
         let mut ev = PathEvent::default();
         let fill = self.cap - prod.slots();
@@ -206,6 +217,10 @@ pub struct OutReader {
 impl OutReader {
     pub fn new(target: usize) -> Self {
         Self { primed: false, target }
+    }
+
+    pub fn set_target(&mut self, target: usize) {
+        self.target = target;
     }
 
     pub fn read(&mut self, cons: &mut Consumer<f32>, out: &mut [f32]) -> bool {

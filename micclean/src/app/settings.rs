@@ -22,6 +22,7 @@ pub enum SetEdit {
     MonitorGain,
     VstDirs,
     Language,
+    LowLatency,
     Saved,
 }
 
@@ -126,6 +127,14 @@ impl Settings {
                     if dc {
                         out.push(SetEdit::Devices);
                     }
+                    row(ui, "", |ui| {
+                        if ui.checkbox(&mut cfg.app.low_latency, t!("Modo de baixa latência", "Low latency mode")).changed() {
+                            out.push(SetEdit::LowLatency);
+                        }
+                    });
+                    row(ui, "", |ui| {
+                        label_muted(ui, t!("Usa o DeepFilterNet sem lookahead: uns 10 ms a menos, limpa um pouco pior e usa mais CPU.", "Uses DeepFilterNet without lookahead: about 10 ms less, slightly worse cleanup and more CPU."));
+                    });
                     let mut g = cfg.app.monitor_gain_db;
                     row(ui, t!("Volume da escuta", "Monitor volume"), |ui| {
                         ui.spacing_mut().slider_width = 300.0;

@@ -87,10 +87,17 @@ pub struct Dfn {
 
 impl Dfn {
     pub fn new(atten_limit_db: f32, post_filter_beta: f32) -> Result<Self, String> {
+        Self::with_model(atten_limit_db, post_filter_beta, false)
+    }
+
+    /// `ll`: modelo DeepFilterNet3 de baixa latência (sem lookahead, 20 ms a menos).
+    pub fn with_model(atten_limit_db: f32, post_filter_beta: f32, ll: bool) -> Result<Self, String> {
+        static LL: &[u8] = include_bytes!("../models/DeepFilterNet3_ll_onnx.tar.gz");
         let rp = RuntimeParams::default_with_ch(1)
             .with_atten_lim(atten_limit_db)
             .with_post_filter(post_filter_beta.max(0.0));
-        let m = DfTract::new(DfParams::default(), &rp).map_err(|e| format!("{e:#}"))?;
+        let params = if ll { DfParams::from_bytes(LL).map_err(|e| format!("{e:#}"))? } else { DfParams::default() };
+        let m = DfTract::new(params, &rp).map_err(|e| format!("{e:#}"))?;
         assert_eq!(m.hop_size, FRAME);
         Ok(Self { m, inb: Array2::zeros((1, FRAME)), outb: Array2::zeros((1, FRAME)) })
     }
@@ -187,6 +194,7 @@ pub struct Pipeline {
     tuning: String,
     atten: f32,
     post: f32,
+    pub ll: bool,
     refb: Vec<f32>,
     pub resets: u64,
 }
@@ -257,6 +265,10 @@ impl Pipeline {
     }
 
     pub fn new(p: &Preset, chain: Box<Chain>) -> Result<Self, String> {
+        Self::with_model(p, chain, false)
+    }
+
+    pub fn with_model(p: &Preset, chain: Box<Chain>, ll: bool) -> Result<Self, String> {
         let (mut tuning, mut atten, mut post) = ("equilibrado".to_string(), 100.0, 0.0);
         for b in &p.blocks {
             match &b.kind {
@@ -268,16 +280,28 @@ impl Pipeline {
         Ok(Self {
             dc: DcBlock::default(),
             aec: Aec::from_tuning(&tuning),
-            dfn: Dfn::new(atten, post)?,
+            dfn: Dfn::with_model(atten, post, ll)?,
             chain,
             bypass: false,
             mute: false,
             tuning,
             atten,
             post,
+            ll,
             refb: vec![0.0; FRAME],
             resets: 0,
         })
+    }
+
+    /// Troca o modelo do DeepFilterNet (aloca; só ao mudar o modo de latência).
+    pub fn set_model(&mut self, ll: bool) {
+        if ll == self.ll {
+            return;
+        }
+        if let Ok(n) = Dfn::with_model(self.atten, self.post, ll) {
+            self.dfn = n;
+            self.ll = ll;
+        }
     }
 
     pub fn set_atten(&mut self, db: f32) {
@@ -349,7 +373,7 @@ impl Pipeline {
         self.refb.copy_from_slice(&reference[..FRAME]);
         t.nan |= sanitize(&mut self.refb);
         if !self.bypass {
-            let Pipeline { aec, dfn, chain, refb, tuning, atten, post, resets, .. } = self;
+            let Pipeline { aec, dfn, chain, refb, tuning, atten, post, resets, ll, .. } = self;
             for s in chain.slots.iter_mut().filter(|s| s.enabled) {
                 match &mut s.fx {
                     Fx::Aec => {
@@ -367,7 +391,7 @@ impl Pipeline {
                         dfn.process(x);
                         if sanitize(x) {
                             t.nan = true;
-                            if let Ok(n) = Dfn::new(*atten, *post) {
+                            if let Ok(n) = Dfn::with_model(*atten, *post, *ll) {
                                 *dfn = n;
                             }
                             *resets += 1;

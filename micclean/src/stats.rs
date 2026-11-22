@@ -4,6 +4,9 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed};
 pub struct Stats {
     pub frames: AtomicU64,
     pub out_underruns: AtomicU64,
+    /// O render do CABLE ficou vazio antes de escrevermos (o Windows tocou silêncio).
+    pub out_starves: AtomicU64,
+    pub low_latency: AtomicBool,
     pub out_overruns: AtomicU64,
     pub ref_underruns: AtomicU64,
     pub ref_overruns: AtomicU64,

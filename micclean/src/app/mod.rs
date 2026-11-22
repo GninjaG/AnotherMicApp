@@ -856,6 +856,9 @@ impl AmaApp {
                 SetEdit::Autostart => sys::set_autostart(self.cfg.app.autostart),
                 SetEdit::MonitorGain => self.st().monitor_gain.set(10f64.powf(self.cfg.app.monitor_gain_db / 20.0)),
                 SetEdit::VstDirs => self.scan = None,
+                SetEdit::LowLatency => {
+                    self.st().low_latency.store(self.cfg.app.low_latency, Relaxed);
+                }
                 SetEdit::Language => {
                     i18n::set(&self.cfg.app.language);
                     self.sys.set_language();

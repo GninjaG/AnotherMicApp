@@ -1,5 +1,5 @@
 use crate::audio::{self, Res};
-use crate::config::{Config, Devices};
+use crate::config::{Config, Devices, out_target_ms};
 use crate::drift::{OutPath, OutReader, RefPath};
 use crate::dsp::Pipeline;
 use crate::fx::chain::{Chain, Cmd, Garbage, Preset};
@@ -44,6 +44,9 @@ impl Engine {
     pub fn start(cfg: &Config, preset: &Preset, chain: Box<Chain>) -> Res<Engine> {
         let stats = Arc::new(Stats::default());
         stats.monitor_gain.set(10f64.powf(cfg.app.monitor_gain_db / 20.0));
+        stats.low_latency.store(cfg.app.low_latency, Relaxed);
+        let ll = cfg.app.low_latency;
+        let out_ms = cfg.buffers.out_ms;
         let devs = Arc::new(DevState { d: Mutex::new(cfg.devices.clone()), generation: AtomicU64::new(0) });
         let stop = Arc::new(AtomicBool::new(false));
         let (out_prod, out_cons) = RingBuffer::<f32>::new(RING);
@@ -58,7 +61,7 @@ impl Engine {
         let (tx, rx) = std::sync::mpsc::channel::<Res<()>>();
         let (c, s, st, dv, pr) = (cfg.clone(), stop.clone(), stats.clone(), devs.clone(), preset.clone());
         handles.push(spawn("mic-dsp", move || {
-            let pipe = match Pipeline::new(&pr, chain) {
+            let pipe = match Pipeline::with_model(&pr, chain, ll) {
                 Ok(p) => p,
                 Err(e) => {
                     let _ = tx.send(Err(e));
@@ -68,8 +71,9 @@ impl Engine {
             let dsp = Dsp {
                 pipe,
                 refp: RefPath::new(c.buffers.ref_ms),
-                outp: OutPath::new(c.buffers.out_ms, RING),
-                monp: OutPath::new(c.buffers.out_ms, RING),
+                outp: OutPath::new(out_target_ms(out_ms, ll), RING),
+                monp: OutPath::new(out_target_ms(out_ms, ll), RING),
+                out_ms,
                 ref_cons,
                 out_prod,
                 mon_prod,
@@ -96,11 +100,10 @@ impl Engine {
         }
         let (dv, s, st) = (devs.clone(), stop.clone(), stats.clone());
         handles.push(spawn("loopback", move || ref_thread(dv, ref_prod, st, s)));
-        let target = (cfg.buffers.out_ms * SR as f64 / 1000.0) as usize;
         let (dv, s, st) = (devs.clone(), stop.clone(), stats.clone());
-        handles.push(spawn("output", move || out_thread(dv, out_cons, target, st, s, false)));
+        handles.push(spawn("output", move || out_thread(dv, out_cons, out_ms, st, s, false)));
         let (dv, s, st) = (devs.clone(), stop.clone(), stats.clone());
-        handles.push(spawn("monitor", move || out_thread(dv, mon_cons, target, st, s, true)));
+        handles.push(spawn("monitor", move || out_thread(dv, mon_cons, out_ms, st, s, true)));
         let s = stop.clone();
         handles.push(spawn("hotplug", move || audio::watch_devices(&s)));
         let (s, st, iv) = (stop.clone(), stats.clone(), cfg.app.stats_interval_s.max(1));
@@ -188,6 +191,7 @@ struct Dsp {
     frame: [f32; FRAME],
     refb: [f32; FRAME],
     fill: usize,
+    out_ms: f64,
     stats: Arc<Stats>,
 }
 
@@ -207,6 +211,14 @@ impl Dsp {
         let st = &*self.stats;
         while let Ok(c) = self.cmd_cons.pop() {
             self.pipe.apply(c, &mut self.bin_prod);
+        }
+        let ll = st.low_latency.load(Relaxed);
+        if ll != self.pipe.ll {
+            self.pipe.set_model(ll);
+            let t = out_target_ms(self.out_ms, ll);
+            self.outp.set_target(t);
+            self.monp.set_target(t);
+            log!("modo de baixa latência: {}", if ll { "ligado" } else { "desligado" });
         }
         self.pipe.mute = st.mute.load(Relaxed);
         self.pipe.bypass = st.bypass.load(Relaxed);
@@ -408,7 +420,8 @@ fn ref_thread(devs: Arc<DevState>, mut prod: Producer<f32>, st: Arc<Stats>, stop
 }
 
 /// Saída para o CABLE ou, com `monitor`, escuta no fone (só enquanto ligada).
-fn out_thread(devs: Arc<DevState>, mut cons: Consumer<f32>, target: usize, st: Arc<Stats>, stop: Arc<AtomicBool>, monitor: bool) {
+fn out_thread(devs: Arc<DevState>, mut cons: Consumer<f32>, out_ms: f64, st: Arc<Stats>, stop: Arc<AtomicBool>, monitor: bool) {
+    let target = |ll: bool| (out_target_ms(out_ms, ll) * SR as f64 / 1000.0) as usize;
     audio::com_init();
     let _mm = audio::mmcss_pro_audio();
     let mut last_err = String::new();
@@ -427,10 +440,21 @@ fn out_thread(devs: Arc<DevState>, mut cons: Consumer<f32>, target: usize, st: A
             let mut h = audio::hotplug();
             let dev = audio::find(Direction::Render, name)?;
             let id = dev.get_id().map_err(|e| e.to_string())?;
-            let mut r = audio::open_render(&dev, 2, None)?;
-            let mut reader = OutReader::new(target);
-            let a = r.available()?;
-            r.write_silence(a)?;
+            let mut r = match audio::open_render_fast(&dev) {
+                Ok(r) => r,
+                Err(e) => {
+                    log!("{tag}: {e}, usando o período padrão");
+                    audio::open_render(&dev, 2, None)?
+                }
+            };
+            let mut ll = st.low_latency.load(Relaxed);
+            let mut reader = OutReader::new(target(ll));
+            // fila no dispositivo: 3 períodos curtos ou 1,5 do padrão de 10 ms
+            let bf = r.buffer_frames as usize;
+            let per = r.period as usize;
+            let queue = if per < 400 { 3 * per } else { per + per / 2 }.min(bf);
+            let mut warm = 0;
+            r.write_silence(queue)?;
             r.client.start_stream().map_err(|e| e.to_string())?;
             if !monitor {
                 inc(&st.out_connects);
@@ -452,7 +476,17 @@ fn out_thread(devs: Arc<DevState>, mut cons: Consumer<f32>, target: usize, st: A
                     continue;
                 }
                 timeouts = 0;
-                let n = r.available()?.min(tmp.len());
+                let now = st.low_latency.load(Relaxed);
+                if now != ll {
+                    ll = now;
+                    reader.set_target(target(ll));
+                }
+                let avail = r.available()?;
+                if avail >= bf && !monitor && warm > 50 {
+                    inc(&st.out_starves);
+                }
+                warm += 1;
+                let n = queue.saturating_sub(bf - avail).min(tmp.len());
                 if n == 0 {
                     continue;
                 }
@@ -482,7 +516,7 @@ fn out_thread(devs: Arc<DevState>, mut cons: Consumer<f32>, target: usize, st: A
 fn stats_thread(st: Arc<Stats>, stop: Arc<AtomicBool>, interval: u64) {
     let mut last_frames = 0;
     let mut last_sum = 0;
-    let mut prev = [0u64; 5];
+    let mut prev = [0u64; 6];
     let mut tick = Instant::now();
     let mut lf = 0;
     let mut ls = 0;
@@ -512,17 +546,18 @@ fn stats_thread(st: Arc<Stats>, stop: Arc<AtomicBool>, interval: u64) {
             get(&st.ref_underruns),
             get(&st.ref_overruns),
             get(&st.mic_glitches),
+            get(&st.out_starves),
         ];
         let d: Vec<u64> = cur.iter().zip(prev.iter()).map(|(a, b)| a - b).collect();
         prev = cur;
         log!(
-            "stats: frames={} proc_med={:.3}ms proc_max={:.3}ms (aec_max={:.3} dfn_max={:.3}) | out_underrun=+{}({}) out_overrun=+{}({}) ref_underrun=+{}({}) ref_overrun=+{}({}) mic_glitch=+{}({}) nan={} limit={} | deriva out={:+.1}ppm ref={:+.1}ppm | buf out={:.1}ms ref={:.1}ms | aec atraso={:.0}ms erle={:.1}dB",
+            "stats: frames={} proc_med={:.3}ms proc_max={:.3}ms (aec_max={:.3} dfn_max={:.3}) | out_underrun=+{}({}) out_overrun=+{}({}) ref_underrun=+{}({}) ref_overrun=+{}({}) mic_glitch=+{}({}) out_starve=+{}({}) nan={} limit={} | deriva out={:+.1}ppm ref={:+.1}ppm | buf out={:.1}ms ref={:.1}ms | aec atraso={:.0}ms erle={:.1}dB",
             frames,
             avg,
             st.proc_ns_max.swap(0, Relaxed) as f64 / 1e6,
             st.aec_ns_max.swap(0, Relaxed) as f64 / 1e6,
             st.dfn_ns_max.swap(0, Relaxed) as f64 / 1e6,
-            d[0], cur[0], d[1], cur[1], d[2], cur[2], d[3], cur[3], d[4], cur[4],
+            d[0], cur[0], d[1], cur[1], d[2], cur[2], d[3], cur[3], d[4], cur[4], d[5], cur[5],
             get(&st.nan_frames),
             get(&st.limited_frames),
             st.out_ppm.get(),

@@ -48,6 +48,12 @@ pub struct Output {
     pub limiter: bool,
 }
 
+pub const OUT_MS: f64 = 6.0;
+/// Alvo do buffer de saída. No modo de baixa latência o DFN tem picos maiores, então leva mais folga.
+pub fn out_target_ms(out_ms: f64, low_latency: bool) -> f64 {
+    if low_latency { out_ms + 4.0 } else { out_ms }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Buffers {
@@ -76,6 +82,8 @@ pub struct App {
     pub window: [f32; 2],
     /// "pt" ou "en"
     pub language: String,
+    /// Modelo DeepFilterNet sem lookahead e buffers mínimos.
+    pub low_latency: bool,
 }
 
 impl Default for Config {
@@ -118,7 +126,7 @@ impl Default for Output {
 }
 impl Default for Buffers {
     fn default() -> Self {
-        Self { out_ms: 20.0, ref_ms: 25.0 }
+        Self { out_ms: OUT_MS, ref_ms: 25.0 }
     }
 }
 impl Default for App {
@@ -144,6 +152,7 @@ impl Default for App {
             monitor_gain_db: 0.0,
             window: [1280.0, 800.0],
             language: "pt".into(),
+            low_latency: false,
         }
     }
 }
@@ -179,7 +188,7 @@ gain_db = 0.0
 limiter = true
 
 [buffers]
-out_ms = 20.0
+out_ms = 6.0
 ref_ms = 25.0
 
 [app]
@@ -201,7 +210,12 @@ impl Config {
             std::fs::write(path, DEFAULT_TOML).map_err(|e| format!("{path:?}: {e}"))?;
         }
         let s = std::fs::read_to_string(path).map_err(|e| format!("{path:?}: {e}"))?;
-        toml::from_str(&s).map_err(|e| format!("{path:?}: {e}"))
+        let mut c: Config = toml::from_str(&s).map_err(|e| format!("{path:?}: {e}"))?;
+        // 20 ms era o padrão antigo: com o render rápido não precisa mais
+        if c.buffers.out_ms == 20.0 {
+            c.buffers.out_ms = OUT_MS;
+        }
+        Ok(c)
     }
 
     pub fn save(&self, path: &Path) -> Result<(), String> {
