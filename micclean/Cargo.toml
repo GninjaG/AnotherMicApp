@@ -58,3 +58,6 @@ opt-level = 3
 [profile.dev.package."*"]
 debug-assertions = false
 opt-level = 3
+
+[build-dependencies]
+embed-resource = "3"
