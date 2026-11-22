@@ -301,19 +301,32 @@ pub fn seg(ui: &mut egui::Ui, items: &[&str], cur: usize) -> Option<usize> {
     out
 }
 
-/// Contorno de coração com a ponta para baixo, centrado em `c`, com largura ~`s`.
-pub fn heart(c: egui::Pos2, s: f32, rot: f32, stroke: Stroke) -> egui::Shape {
-    let k = s / 34.0;
-    let (sn, cs) = rot.sin_cos();
-    let pts = (0..48)
-        .map(|i| {
-            let t = i as f32 / 48.0 * std::f32::consts::TAU;
-            let x = 16.0 * t.sin().powi(3) * k;
-            let y = -(13.0 * t.cos() - 5.0 * (2.0 * t).cos() - 2.0 * (3.0 * t).cos() - (4.0 * t).cos()) * k;
-            egui::pos2(c.x + x * cs - y * sn, c.y + x * sn + y * cs)
-        })
-        .collect();
-    egui::Shape::closed_line(pts, stroke)
+/// Coração de 5 barras verticais (como as do ícone): (x, topo, base) com y para baixo,
+/// x em -0.92..0.92 e altura ~2.2, centrado em 0.
+pub fn heart_bars() -> &'static [(f32, f32, f32); 5] {
+    static B: std::sync::OnceLock<[(f32, f32, f32); 5]> = std::sync::OnceLock::new();
+    B.get_or_init(|| {
+        let mut out = [(0.0, 0.0, 0.0); 5];
+        for (k, o) in out.iter_mut().enumerate() {
+            let u = (k as f32 - 2.0) * 0.5;
+            let x = u * 0.92;
+            let inside = |y: f32| (x * x + y * y - 1.0).powi(3) - x * x * y * y * y <= 0.0;
+            let ys: Vec<f32> = (0..=400).map(|i| -1.2 + 2.6 * i as f32 / 400.0).filter(|&y| inside(y)).collect();
+            let (lo, hi) = (ys[0], ys[ys.len() - 1]);
+            *o = (x, -(hi - 0.12), -(lo - 0.12));
+        }
+        out
+    })
+}
+
+/// Coração de barras centrado em `c`, com largura ~`s`.
+pub fn heart(p: &egui::Painter, c: egui::Pos2, s: f32, col: Color32) {
+    let k = s / 2.3;
+    let w = (s / 5.0 * 0.62).max(1.0);
+    for &(x, t, b) in heart_bars() {
+        let r = Rect::from_x_y_ranges(c.x + x * k - w / 2.0..=c.x + x * k + w / 2.0, c.y + t * k..=c.y + b * k);
+        p.rect_filled(r, w * 0.2, col);
+    }
 }
 
 /// Corações bem apagados subindo devagar pelo fundo de `rect`. Parados se `time` não muda.
@@ -324,15 +337,14 @@ pub fn hearts(p: &egui::Painter, rect: Rect, time: f64) {
             let x = (i as u32).wrapping_mul(2654435761).wrapping_add(k.wrapping_mul(40503)) ^ 0x9e37_79b9;
             (x.wrapping_mul(2246822519) >> 8) as f32 / (1u32 << 24) as f32
         };
-        let size = 10.0 + 18.0 * h(1);
+        let size = 12.0 + 18.0 * h(1);
         let speed = 5.0 + 9.0 * h(2);
         let span = rect.height() + 60.0;
         let y = rect.bottom() + 30.0 - ((h(3) * span + time as f32 * speed) % span);
         let x = rect.left() + rect.width() * (0.04 + 0.92 * h(4)) + 10.0 * (time as f32 * 0.4 + h(5) * 6.0).sin();
-        let rot = 0.25 * (time as f32 * 0.3 + h(6) * 6.0).sin();
         let edge = ((y - rect.top()) / 80.0).min((rect.bottom() - y) / 80.0).clamp(0.0, 1.0);
-        let a = (10.0 + 14.0 * h(7)) * edge;
+        let a = (7.0 + 11.0 * h(7)) * edge;
         let col = Color32::from_rgba_unmultiplied(ACCENT.r(), ACCENT.g(), ACCENT.b(), a as u8);
-        p.add(heart(egui::pos2(x, y), size, rot, Stroke::new(1.2, col)));
+        heart(p, egui::pos2(x, y), size, col);
     }
 }

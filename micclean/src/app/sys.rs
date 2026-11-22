@@ -20,10 +20,13 @@ pub enum SysEv {
 }
 
 pub fn icon_rgba(n: u32) -> Vec<u8> {
-    // quadrado arredondado escuro com três barras de nível em rosa
+    // quadrado arredondado escuro com um coração de barras rosa
     let mut px = Vec::with_capacity((n * n * 4) as usize);
     let s = n as f32 / 32.0;
-    let bars = [(9.0, 12.0, 20.0), (14.5, 7.0, 25.0), (20.0, 10.0, 22.0)];
+    let k = 22.0 / 2.3;
+    let w = 3.0;
+    let bars: Vec<(f32, f32, f32)> = super::theme::heart_bars().iter().map(|&(x, t, b)| (16.0 + x * k, 16.0 + t * k, 16.0 + b * k)).collect();
+    let ss = 4;
     for y in 0..n {
         for x in 0..n {
             let (fx, fy) = (x as f32 / s + 0.5 / s, y as f32 / s + 0.5 / s);
@@ -36,12 +39,17 @@ pub fn icon_rgba(n: u32) -> Vec<u8> {
                 continue;
             }
             let a = ((0.5 - d).clamp(0.0, 1.0) * 255.0) as u8;
-            let on = bars.iter().any(|&(bx, top, bot)| (fx - bx - 1.5).abs() < 1.6 && fy > top && fy < bot);
-            if on {
-                px.extend_from_slice(&[0xe2, 0x4a, 0x76, a]);
-            } else {
-                px.extend_from_slice(&[0x1f, 0x19, 0x1f, a]);
+            let mut hit = 0;
+            for j in 0..ss * ss {
+                let qx = (x as f32 + ((j % ss) as f32 + 0.5) / ss as f32) / s;
+                let qy = (y as f32 + ((j / ss) as f32 + 0.5) / ss as f32) / s;
+                if bars.iter().any(|&(bx, t, b)| (qx - bx).abs() < w / 2.0 && qy > t && qy < b) {
+                    hit += 1;
+                }
             }
+            let c = hit as f32 / (ss * ss) as f32;
+            let mix = |p: u8, q: u8| (p as f32 + (q as f32 - p as f32) * c) as u8;
+            px.extend_from_slice(&[mix(0x1f, 0xe2), mix(0x19, 0x4a), mix(0x1f, 0x76), a]);
         }
     }
     px

@@ -378,7 +378,7 @@ impl Settings {
                             ui.label(RichText::new(t!("Feito por", "Made by")).color(MUTED));
                             ui.label(RichText::new("@ruptvra").font(semibold(14.0)).color(ACCENT));
                             let (r, _) = ui.allocate_exact_size(vec2(14.0, 18.0), egui::Sense::hover());
-                            ui.painter().add(heart(r.center(), 12.0, 0.0, egui::Stroke::new(1.4, ACCENT)));
+                            heart(ui.painter(), r.center(), 12.0, ACCENT);
                             ui.add_space(8.0);
                             ui.hyperlink_to("Buy me a coffee", "https://buymeacoffee.com/ruptvra");
                         });
