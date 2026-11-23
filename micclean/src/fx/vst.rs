@@ -448,6 +448,7 @@ pub fn scan(dirs: &[String]) -> Vec<PathBuf> {
     for d in dirs {
         walk(Path::new(d), 0, &mut out);
     }
+    walk(&crate::config::data_dir().join("VST"), 0, &mut out);
     out.sort();
     out.dedup();
     out

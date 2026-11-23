@@ -326,10 +326,30 @@ impl Settings {
                         }
                     });
 
+                    section(ui, t!("Pasta do AMA", "AMA folder"), false);
+                    let data = micclean::config::data_dir();
+                    row(ui, t!("Ajustes e presets", "Settings and presets"), |ui| {
+                        ui.add(egui::Label::new(RichText::new(data.display().to_string()).color(TEXT).size(12.5)).truncate());
+                    });
+                    row(ui, "", |ui| {
+                        if ui.button(t!("Abrir pasta", "Open folder")).clicked() {
+                            super::open_folder(&data);
+                        }
+                        if ui.button(t!("Abrir pasta VST", "Open VST folder")).on_hover_text(t!("Plugins colocados aqui aparecem sempre na lista.", "Plugins placed here always show up in the list.")).clicked() {
+                            super::open_folder(&data.join("VST"));
+                        }
+                    });
+
                     section(ui, t!("Pastas de plugins VST", "VST plugin folders"), false);
                     let mut del = None;
                     egui::Frame::new().fill(BG).corner_radius(8).inner_margin(egui::Margin::symmetric(10, 6)).show(ui, |ui| {
                         ui.set_width(ui.available_width());
+                        ui.horizontal(|ui| {
+                            let (r, _) = ui.allocate_exact_size(vec2(8.0, 18.0), egui::Sense::hover());
+                            ui.painter().circle_filled(r.center(), 3.0, OK);
+                            ui.add(egui::Label::new(RichText::new(data.join("VST").display().to_string()).color(TEXT).size(12.5)).truncate());
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| label_muted(ui, t!("do AMA", "AMA's own")));
+                        });
                         for (k, dir) in cfg.app.vst_dirs.iter().enumerate() {
                             ui.horizontal(|ui| {
                                 let exists = std::path::Path::new(dir).is_dir();
@@ -345,9 +365,6 @@ impl Settings {
                                     }
                                 });
                             });
-                        }
-                        if cfg.app.vst_dirs.is_empty() {
-                            label_muted(ui, t!("Nenhuma pasta.", "No folders."));
                         }
                     });
                     if let Some(k) = del {

@@ -38,7 +38,7 @@ fn run(cmd: &str, args: &[&str]) -> Result<i32, String> {
 }
 
 fn backups() -> std::path::PathBuf {
-    let dir = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.join("backups"))).unwrap_or_else(|| "backups".into());
+    let dir = micclean::config::data_dir().join("backups");
     let _ = std::fs::create_dir_all(&dir);
     dir
 }

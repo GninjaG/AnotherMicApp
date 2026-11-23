@@ -235,6 +235,13 @@ pub fn exe_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+/// Pasta de dados do AMA (%APPDATA%\AMA): ajustes, presets, log e a subpasta VST.
+pub fn data_dir() -> PathBuf {
+    let d = std::env::var_os("APPDATA").map(|a| PathBuf::from(a).join("AMA")).unwrap_or_else(exe_dir);
+    let _ = std::fs::create_dir_all(d.join("VST"));
+    d
+}
+
 impl Config {
     pub fn load_or_create(path: &Path) -> Result<Config, String> {
         let new = !path.exists();

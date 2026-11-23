@@ -94,10 +94,15 @@ fn main() {
         return;
     }
     let start_hidden = has("--tray");
+    let base = micclean::config::data_dir();
+    let moved = app::move_old_data(&exe_dir(), &base);
     let (mut cfg, cfg_path) = app::load_config(&base);
     app::i18n::set(&cfg.app.language);
     micclean::logger::init(&cfg.resolve(&base, &cfg.app.log_file), cfg!(debug_assertions));
     log!("AMA {} iniciando{}", env!("CARGO_PKG_VERSION"), if start_hidden { " na bandeja" } else { "" });
+    if !moved.is_empty() {
+        log!("movido de {} para {}: {}", exe_dir().display(), base.display(), moved.join(", "));
+    }
     let store = Store::new(&base);
     let mut preset = None;
     if !cfg.app.preset.is_empty() {

@@ -488,7 +488,9 @@ impl AmaApp {
     }
 
     fn pick_vst(&self) -> Option<PathBuf> {
-        let dir = self.cfg.app.vst_dirs.iter().find(|d| Path::new(d).is_dir()).cloned().unwrap_or_default();
+        let own = micclean::config::data_dir().join("VST");
+        let has = std::fs::read_dir(&own).is_ok_and(|mut r| r.next().is_some());
+        let dir = if has { own } else { self.cfg.app.vst_dirs.iter().find(|d| Path::new(d).is_dir()).map(PathBuf::from).unwrap_or(own) };
         rfd::FileDialog::new().set_title(t!("Plugin VST2 (64 bits)", "VST2 plugin (64-bit)")).add_filter(t!("Plugin VST", "VST plugin"), &["dll"]).set_directory(dir).pick_file()
     }
 
@@ -1270,6 +1272,39 @@ impl eframe::App for AmaApp {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.shutdown();
     }
+}
+
+fn copy_all(a: &Path, b: &Path) -> std::io::Result<()> {
+    if a.is_dir() {
+        std::fs::create_dir_all(b)?;
+        for e in std::fs::read_dir(a)?.flatten() {
+            copy_all(&e.path(), &b.join(e.file_name()))?;
+        }
+        Ok(())
+    } else {
+        std::fs::copy(a, b).map(|_| ())
+    }
+}
+
+/// Leva ajustes, presets e log que ficavam ao lado do exe para a pasta de dados (só na primeira vez).
+pub fn move_old_data(from: &Path, to: &Path) -> Vec<String> {
+    let mut out = vec![];
+    if from == to || to.join("ama.toml").exists() || !from.join("ama.toml").exists() {
+        return out;
+    }
+    for n in ["ama.toml", "presets", "ama.log", "backups"] {
+        let (a, b) = (from.join(n), to.join(n));
+        if a.exists() && !b.exists() && (std::fs::rename(&a, &b).is_ok() || copy_all(&a, &b).is_ok()) {
+            out.push(n.to_string());
+        }
+    }
+    out
+}
+
+/// Abre a pasta no Explorer.
+pub fn open_folder(p: &Path) {
+    let _ = std::fs::create_dir_all(p);
+    let _ = std::process::Command::new("explorer").arg(p).spawn();
 }
 
 /// Primeira execução: ama.toml herda os ajustes do micclean (config.toml), se existir.
