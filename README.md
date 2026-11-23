@@ -31,7 +31,7 @@ AMA reads the mic and a loopback of your speakers through WASAPI at 48 kHz and p
 
 Global hotkeys: `Ctrl+Alt+M` mutes, `Ctrl+Alt+B` bypasses (raw mic). Both can be changed in Settings. Closing the window can send AMA to the tray, where it keeps running.
 
-Files next to the exe: `ama.toml` (settings), `presets\` (one `.toml` per preset) and `ama.log`.
+Files live in `%APPDATA%\AMA`: `ama.toml` (settings), `presets\` (one `.toml` per preset), `ama.log` and `VST\`. Plugins dropped in `VST\` always show up in the plugin list. Settings has buttons to open both folders. Older versions kept these files next to the exe; they are moved on first start.
 
 The interface language (English or Portuguese) is set in Settings.
 
@@ -73,7 +73,7 @@ O AMA lê o mic e um loopback das caixas pelo WASAPI a 48 kHz e processa quadros
 
 Atalhos globais: `Ctrl+Alt+M` muta, `Ctrl+Alt+B` liga o bypass (mic cru). Dá para trocar os dois em Ajustes. Fechando a janela, o AMA pode ir para a bandeja e continuar rodando.
 
-Arquivos ao lado do exe: `ama.toml` (ajustes), `presets\` (um `.toml` por preset) e `ama.log`.
+Os arquivos ficam em `%APPDATA%\AMA`: `ama.toml` (ajustes), `presets\` (um `.toml` por preset), `ama.log` e `VST\`. Plugins colocados em `VST\` aparecem sempre na lista. Em Ajustes há botões para abrir as duas pastas. Versões antigas guardavam esses arquivos ao lado do exe; eles são movidos na primeira execução.
 
 O idioma da interface (português ou inglês) fica em Ajustes.
 
