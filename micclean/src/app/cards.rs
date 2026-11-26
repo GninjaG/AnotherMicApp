@@ -542,8 +542,11 @@ fn band_label(f: f64) -> String {
 }
 
 fn faders(ui: &mut egui::Ui, nodes: &mut [(f64, f64)]) -> bool {
+    if nodes.is_empty() {
+        return false;
+    }
     const R: f64 = 18.0;
-    let n = nodes.len().max(1);
+    let n = nodes.len();
     let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 170.0), Sense::click_and_drag());
     let body = Rect::from_min_max(rect.min, rect.max - vec2(0.0, 18.0));
     let w = body.width() / n as f32;

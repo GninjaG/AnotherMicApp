@@ -176,8 +176,12 @@ impl CableUi {
                         Err(e) => (tr!("Falhou: {e}", "Failed: {e}"), true),
                     });
                 }
-                Err(_) => {
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
                     ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.busy = None;
+                    self.msg = Some((t!("Falha ao comunicar com o processo.", "Failed to communicate with the process.").into(), true));
                 }
             }
         }

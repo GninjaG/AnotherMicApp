@@ -1,7 +1,8 @@
 // Portado de EqualizerAPO filters/GraphicEQFilter.cpp e helpers/GainIterator.cpp (GPL-2.0, Jonas Thedering).
-use rustfft::FftPlanner;
+use rustfft::{Fft, FftPlanner};
 use rustfft::num_complex::Complex64;
 use std::f64::consts::PI;
+use std::sync::{Arc, OnceLock};
 
 pub const BANDS_15: [f64; 15] =
     [25.0, 40.0, 63.0, 100.0, 160.0, 250.0, 400.0, 630.0, 1000.0, 1600.0, 2500.0, 4000.0, 6300.0, 10000.0, 16000.0];
@@ -33,8 +34,16 @@ pub fn gain_at(nodes: &[(f64, f64)], f: f64) -> f64 {
 
 pub fn sorted(nodes: &[(f64, f64)]) -> Vec<(f64, f64)> {
     let mut v: Vec<(f64, f64)> = nodes.iter().copied().filter(|n| n.0 > 0.0 && n.0.is_finite()).collect();
-    v.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    v.sort_by(|a, b| a.0.total_cmp(&b.0));
     v
+}
+
+fn plans() -> &'static (Arc<dyn Fft<f64>>, Arc<dyn Fft<f64>>) {
+    static P: OnceLock<(Arc<dyn Fft<f64>>, Arc<dyn Fft<f64>>)> = OnceLock::new();
+    P.get_or_init(|| {
+        let mut pl = FftPlanner::<f64>::new();
+        (pl.plan_fft_forward(2 * FILTER_LEN), pl.plan_fft_inverse(2 * FILTER_LEN))
+    })
 }
 
 /// FIR de fase mínima (FILTER_LEN taps) como no EAPO.
@@ -42,9 +51,7 @@ pub fn design(nodes: &[(f64, f64)], srate: f64) -> Vec<f32> {
     let nodes = sorted(nodes);
     let l = FILTER_LEN;
     let n = 2 * l;
-    let mut pl = FftPlanner::<f64>::new();
-    let fwd = pl.plan_fft_forward(n);
-    let inv = pl.plan_fft_inverse(n);
+    let (fwd, inv) = plans();
     let mut fd = vec![Complex64::default(); n];
     for i in 0..l {
         let f = i as f64 * srate / n as f64;

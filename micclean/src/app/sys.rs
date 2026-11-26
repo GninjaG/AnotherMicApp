@@ -3,8 +3,8 @@ use global_hotkey::hotkey::{Code, HotKey, Modifiers};
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 use micclean::log;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering::Relaxed};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicIsize, Ordering::Relaxed};
+use std::sync::{Arc, Condvar, Mutex};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem, Submenu};
 use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
@@ -74,8 +74,8 @@ pub struct Sys {
     hk_keys: Vec<HotKey>,
     preset_ids: Option<Arc<Mutex<Vec<(MenuId, String)>>>>,
     pub hwnd: Arc<AtomicIsize>,
-    /// Liga a thread que acompanha o programa em foco (presets por programa).
-    pub focus_on: Arc<AtomicBool>,
+    /// Estado `(ativo, parar)` da thread que acompanha o programa em foco.
+    focus: Arc<(Mutex<(bool, bool)>, Condvar)>,
 }
 
 impl Sys {
@@ -100,30 +100,59 @@ impl Sys {
             let _ = t.send(ev);
             c.request_repaint();
         }));
-        let focus_on: Arc<AtomicBool> = Default::default();
-        let (on, t, c) = (focus_on.clone(), tx.clone(), ctx.clone());
+        let focus: Arc<(Mutex<(bool, bool)>, Condvar)> = Arc::new((Mutex::new((false, false)), Condvar::new()));
+        let (f, t, c) = (focus.clone(), tx.clone(), ctx.clone());
         std::thread::Builder::new()
             .name("focus".into())
             .spawn(move || {
                 let mut last = String::new();
                 loop {
-                    std::thread::sleep(std::time::Duration::from_millis(400));
-                    if !on.load(Relaxed) {
-                        last.clear();
-                        continue;
-                    }
-                    let Some(exe) = foreground_exe() else { continue };
-                    if exe != last {
-                        last = exe.clone();
-                        if t.send(SysEv::Focus(exe)).is_err() {
-                            return;
+                    let (on, stop) = {
+                        let mut g = f.0.lock().unwrap();
+                        while !g.0 && !g.1 {
+                            last.clear();
+                            g = f.1.wait(g).unwrap();
                         }
-                        c.request_repaint();
+                        *g
+                    };
+                    if stop {
+                        return;
+                    }
+                    if on {
+                        if let Some(exe) = foreground_exe() {
+                            if exe != last {
+                                last = exe.clone();
+                                if t.send(SysEv::Focus(exe)).is_err() {
+                                    return;
+                                }
+                                c.request_repaint();
+                            }
+                        }
+                    }
+                    let mut g = f.0.lock().unwrap();
+                    if !g.1 {
+                        let (ng, _) = f.1.wait_timeout(g, std::time::Duration::from_millis(400)).unwrap();
+                        g = ng;
+                    }
+                    if g.1 {
+                        return;
                     }
                 }
             })
             .ok();
-        Sys { rx, tx, tray: None, hk: GlobalHotKeyManager::new().ok(), hk_ids, hk_keys: vec![], preset_ids: None, hwnd: Default::default(), focus_on }
+        Sys { rx, tx, tray: None, hk: GlobalHotKeyManager::new().ok(), hk_ids, hk_keys: vec![], preset_ids: None, hwnd: Default::default(), focus }
+    }
+
+    pub fn set_focus_watch(&self, on: bool) {
+        let mut g = self.focus.0.lock().unwrap();
+        g.0 = on;
+        self.focus.1.notify_all();
+    }
+
+    pub fn stop_focus(&self) {
+        let mut g = self.focus.0.lock().unwrap();
+        g.1 = true;
+        self.focus.1.notify_all();
     }
 
     pub fn build_tray(&mut self, ctx: &egui::Context, presets: &[String], current: &str) {
@@ -325,11 +354,12 @@ pub fn set_autostart(on: bool) {
     let Some(lnk) = startup_lnk() else { return };
     if on {
         let exe = std::env::current_exe().unwrap_or_default();
+        let esc = |s: &str| s.replace('\'', "''");
         let ps = format!(
             "$s=(New-Object -ComObject WScript.Shell).CreateShortcut('{}');$s.TargetPath='{}';$s.Arguments='--tray';$s.WorkingDirectory='{}';$s.Save()",
-            lnk.display(),
-            exe.display(),
-            micclean::config::exe_dir().display()
+            esc(&lnk.to_string_lossy()),
+            esc(&exe.to_string_lossy()),
+            esc(&micclean::config::exe_dir().to_string_lossy())
         );
         use std::os::windows::process::CommandExt;
         let ok = std::process::Command::new("powershell")
@@ -347,15 +377,37 @@ pub fn set_autostart(on: bool) {
 
 /// Volume mestre da reprodução padrão em dB (usado pelo Loudness correction, como no EAPO).
 pub fn master_volume_db() -> Option<f64> {
-    use windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume;
-    use windows::Win32::Media::Audio::{IMMDeviceEnumerator, MMDeviceEnumerator, eMultimedia, eRender};
-    use windows::Win32::System::Com::{CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx};
-    unsafe {
-        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-        let en: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).ok()?;
-        let dev = en.GetDefaultAudioEndpoint(eRender, eMultimedia).ok()?;
-        let vol: IAudioEndpointVolume = dev.Activate(CLSCTX_ALL, None).ok()?;
-        vol.GetMasterVolumeLevel().ok().map(|v| v as f64)
+    VolWatcher::default().get()
+}
+
+#[derive(Default)]
+pub struct VolWatcher {
+    ep: Option<(u64, windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume)>,
+}
+
+impl VolWatcher {
+    pub fn get(&mut self) -> Option<f64> {
+        use windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume;
+        use windows::Win32::Media::Audio::{IMMDeviceEnumerator, MMDeviceEnumerator, eMultimedia, eRender};
+        use windows::Win32::System::Com::{CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx};
+        let h = micclean::audio::hotplug();
+        if let Some((eh, ref vol)) = self.ep {
+            if eh == h {
+                if let Ok(v) = unsafe { vol.GetMasterVolumeLevel() } {
+                    return Some(v as f64);
+                }
+            }
+            self.ep = None;
+        }
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+            let en: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).ok()?;
+            let dev = en.GetDefaultAudioEndpoint(eRender, eMultimedia).ok()?;
+            let vol: IAudioEndpointVolume = dev.Activate(CLSCTX_ALL, None).ok()?;
+            let v = vol.GetMasterVolumeLevel().ok()? as f64;
+            self.ep = Some((h, vol));
+            Some(v)
+        }
     }
 }
 

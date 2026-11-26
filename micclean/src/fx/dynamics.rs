@@ -5,12 +5,21 @@ use super::biquad::{BqParams, BqType, Biquad, Coefs, Width};
 use crate::SR;
 use serde::{Deserialize, Serialize};
 
+const DB_TO_LN: f64 = std::f64::consts::LN_10 / 20.0;
+const LN_TO_DB: f64 = 20.0 / std::f64::consts::LN_10;
+
 fn coef(ms: f64) -> f64 {
     (-1.0 / (ms.max(0.05) / 1000.0 * SR as f64)).exp()
 }
 
 fn to_db(x: f64) -> f64 {
-    20.0 * (x.abs() + 1e-10).log10()
+    (x.abs() + 1e-10).ln() * LN_TO_DB
+}
+
+fn flush_f64(s: &mut f64) {
+    if s.abs() < f64::MIN_POSITIVE || !s.is_finite() {
+        *s = 0.0;
+    }
 }
 
 fn gain_computer(x: f64, t: f64, r: f64, w: f64) -> f64 {
@@ -83,8 +92,10 @@ impl Comp {
             self.y1 = xl.max(self.ar * self.y1 + (1.0 - self.ar) * xl);
             self.yl = self.aa * self.yl + (1.0 - self.aa) * self.y1;
             gr = gr.max(self.yl);
-            *v *= 10f64.powf((self.makeup - self.yl) / 20.0) as f32;
+            *v *= ((self.makeup - self.yl) * DB_TO_LN).exp() as f32;
         }
+        flush_f64(&mut self.y1);
+        flush_f64(&mut self.yl);
         self.gr_db = gr as f32;
     }
 }
@@ -167,7 +178,7 @@ impl DeEss {
             self.y1 = xl.max(self.ar * self.y1 + (1.0 - self.ar) * xl);
             self.yl = self.aa * self.yl + (1.0 - self.aa) * self.y1;
             gr = gr.max(self.yl);
-            let g = 10f64.powf(-self.yl / 20.0);
+            let g = if self.yl <= 0.0 { 1.0 } else { (-self.yl * DB_TO_LN).exp() };
             *v = if self.p.split {
                 let l1 = self.lo[0].tick(s);
                 let l = self.lo[1].tick(l1);
@@ -177,6 +188,11 @@ impl DeEss {
             } else {
                 (s * g) as f32
             };
+        }
+        flush_f64(&mut self.y1);
+        flush_f64(&mut self.yl);
+        for b in self.side.iter_mut().chain(self.lo.iter_mut()).chain(self.hi.iter_mut()) {
+            b.flush_denormals();
         }
         self.gr_db = gr as f32;
     }

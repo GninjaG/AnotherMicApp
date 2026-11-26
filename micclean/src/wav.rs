@@ -3,10 +3,16 @@ use std::path::Path;
 pub fn read_mono(path: &Path) -> Result<(Vec<f32>, u32), String> {
     let mut r = hound::WavReader::open(path).map_err(|e| format!("{path:?}: {e}"))?;
     let spec = r.spec();
+    if spec.channels == 0 {
+        return Err(format!("{path:?}: sem canais"));
+    }
     let ch = spec.channels as usize;
     let raw: Vec<f32> = match spec.sample_format {
         hound::SampleFormat::Float => r.samples::<f32>().map(|s| s.unwrap_or(0.0)).collect(),
         hound::SampleFormat::Int => {
+            if spec.bits_per_sample == 0 || spec.bits_per_sample > 32 {
+                return Err(format!("{path:?}: profundidade de bits inválida: {}", spec.bits_per_sample));
+            }
             let scale = 1.0 / (1u64 << (spec.bits_per_sample - 1)) as f32;
             r.samples::<i32>().map(|s| s.unwrap_or(0) as f32 * scale).collect()
         }

@@ -1,10 +1,7 @@
 use crate::{FRAME, SR};
 use rtrb::{Consumer, Producer};
 use rubato::audioadapter_buffers::direct::InterleavedSlice;
-use rubato::{Adjustable,
-    Async, FixedAsync, Resampler, SincInterpolationParameters, SincInterpolationType,
-    WindowFunction,
-};
+use rubato::{Adjustable, Async, FixedAsync, PolynomialDegree, Resampler};
 
 const MAX_DEV: f64 = 0.002;
 
@@ -66,14 +63,7 @@ impl RateCtl {
 }
 
 fn make_resampler(fixed: FixedAsync) -> Async<f32> {
-    let p = SincInterpolationParameters {
-        sinc_len: 64,
-        f_cutoff: Some(0.95),
-        oversampling_factor: 128,
-        interpolation: SincInterpolationType::Linear,
-        window: WindowFunction::BlackmanHarris2,
-    };
-    Async::<f32>::new_sinc(1.0, 1.01, &p, FRAME, 1, fixed).expect("resampler")
+    Async::<f32>::new_poly(1.0, 1.01, PolynomialDegree::Septic, FRAME, 1, fixed).expect("resampler")
 }
 
 #[derive(Default, Debug, Clone, Copy)]
@@ -160,8 +150,8 @@ pub struct OutPath {
 }
 
 /// Pushes (de 10 ms) para medir o menor nível do buffer.
-const LOW_WIN: usize = 10;
-/// Acima do alvo por mais que isso em toda a janela: descarta o excesso em vez de esperar o PI.
+const LOW_WIN: usize = 50;
+/// Acima do alvo por mais que 1 frame + esta folga em toda a janela: descarta o excesso em vez de esperar o PI.
 const SLACK: usize = SR / 500;
 const XFADE: usize = 32;
 
@@ -197,8 +187,8 @@ impl OutPath {
         self.low = self.low.min(fill);
         self.nlow += 1;
         if self.nlow >= LOW_WIN {
-            if self.low > self.target + SLACK {
-                self.skip = self.low - self.target;
+            if self.low > self.target + FRAME + SLACK {
+                self.skip = self.low - (self.target + SLACK);
                 self.ctl.reset_level();
             }
             self.low = usize::MAX;
@@ -279,5 +269,46 @@ impl OutReader {
             return true;
         }
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rtrb::RingBuffer;
+
+    #[test]
+    fn poly_septic_low_latency_and_transparent() {
+        let mut outp = OutPath::new(10.0, SR / 2);
+        let refp = RefPath::new(25.0);
+        assert!(outp.latency_frames() - outp.target <= 8, "out delay: {}", outp.latency_frames() - outp.target);
+        assert!(refp.latency_frames() - refp.target <= 8, "ref delay: {}", refp.latency_frames() - refp.target);
+
+        let (mut prod, mut cons) = RingBuffer::<f32>::new(SR / 2);
+        let mut reader = OutReader::new(outp.target);
+        let mut out = [0.0f32; FRAME];
+        for freq in [1000.0f64, 10_000.0] {
+            let mut sum_in = 0.0f64;
+            let mut sum_out = 0.0f64;
+            let mut phase = 0.0f64;
+            let mut inp = [0.0f32; FRAME];
+            for k in 0..200 {
+                for s in inp.iter_mut() {
+                    *s = 0.25 * (2.0 * std::f64::consts::PI * phase).sin() as f32;
+                    phase += freq / SR as f64;
+                }
+                let _ = outp.rs.set_resample_ratio_relative(1.0002, true);
+                outp.push(&inp, &mut prod);
+                reader.read(&mut cons, &mut out);
+                if k >= 50 {
+                    sum_in += inp.iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>();
+                    sum_out += out.iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>();
+                }
+            }
+            let diff_db = 10.0 * (sum_out / sum_in.max(1e-20)).log10();
+            assert!(diff_db.abs() < 0.1, "{freq} Hz gain error: {diff_db:.3} dB");
+        }
+        // Silencia warning de variável refp usada acima
+        let _ = refp.ctl.drift_ppm();
     }
 }

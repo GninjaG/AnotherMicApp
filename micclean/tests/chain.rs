@@ -130,7 +130,8 @@ fn t6c_troca_atenuacao_ao_vivo() {
     let mut pipe = Pipeline::from_config(&cfg).unwrap();
     let n = 12 * SR;
     let fan = fan_noise(n, 5);
-    let fan: Vec<f32> = fan.iter().map(|v| v * 0.03 / rms_db(&fan).max(-200.0).abs().max(1.0) as f32).collect();
+    let denom = rms_db(&fan).max(-200.0).abs().max(1.0) as f32;
+    let fan: Vec<f32> = fan.iter().map(|v| v * 0.03 / denom).collect();
     let mut out = Vec::with_capacity(n);
     let mut f = [0.0f32; FRAME];
     for (k, c) in fan.chunks(FRAME).enumerate() {

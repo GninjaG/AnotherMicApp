@@ -41,12 +41,21 @@ impl PopAnim {
             return;
         }
         let now = ctx.input(|i| i.time);
-        let skip: Vec<Id> = NOT_POPUPS.iter().map(|n| Id::unique(*n)).collect();
+        let is_not_popup = |id: Id| NOT_POPUPS.iter().any(|n| Id::unique(*n) == id);
+        let has_popup = ctx.memory(|m| {
+            m.areas()
+                .visible_layer_ids()
+                .into_iter()
+                .any(|l| l.order == Order::Foreground && !is_not_popup(l.id))
+        });
+        if !has_popup && self.open.is_empty() && self.ghosts.is_empty() {
+            return;
+        }
         let pointer = ctx.input(|i| i.pointer.interact_pos());
         let layers: Vec<LayerId> = ctx
             .memory(|m| m.areas().visible_layer_ids())
             .into_iter()
-            .filter(|l| l.order == Order::Foreground && !skip.contains(&l.id))
+            .filter(|l| l.order == Order::Foreground && !is_not_popup(l.id))
             .filter(|l| ctx.graphics(|g| g.get(*l).is_some_and(|p| !p.is_empty())))
             .collect();
 

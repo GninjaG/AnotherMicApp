@@ -66,7 +66,7 @@ impl Store {
 
     pub fn rename(&self, old: &str, p: &Preset) -> Result<(), String> {
         self.save(p)?;
-        if file_name(old) != file_name(&p.name) {
+        if !file_name(old).eq_ignore_ascii_case(&file_name(&p.name)) {
             let _ = std::fs::remove_file(self.path(old));
         }
         Ok(())
@@ -96,4 +96,24 @@ pub fn chrono_stamp() -> String {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
     format!("{y:04}{m:02}{d:02}-{:02}{:02}{:02}", secs / 3600, secs % 3600 / 60, secs % 60)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rename_mesmo_nome_outra_caixa_nao_apaga_arquivo() {
+        let dir = std::env::temp_dir().join("ama_presets_case_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::new(&dir);
+        let p = Preset::default_chain("Teste");
+        store.save(&p).unwrap();
+        let mut p2 = p.clone();
+        p2.name = "teste".into();
+        store.rename("Teste", &p2).unwrap();
+        assert!(store.exists("teste"));
+        assert!(store.load("teste").is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

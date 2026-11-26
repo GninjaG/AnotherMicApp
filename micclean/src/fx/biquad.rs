@@ -110,9 +110,13 @@ impl Coefs {
             } else {
                 bw
             };
-            let f = 10f64.powf(gain.abs() / 80.0 / s);
-            if kind == BqType::LowShelf { freq *= f } else { freq /= f }
-            freq = freq.clamp(1.0, srate * 0.499);
+            if s > 1e-6 && s.is_finite() {
+                let f = 10f64.powf(gain.abs() / 80.0 / s);
+                if f.is_finite() {
+                    if kind == BqType::LowShelf { freq *= f } else { freq /= f }
+                    freq = freq.clamp(1.0, srate * 0.499);
+                }
+            }
         }
         let a = if matches!(kind, BqType::Peak | BqType::LowShelf | BqType::HighShelf) {
             10f64.powf(gain / 40.0)
@@ -193,13 +197,34 @@ impl Biquad {
         y
     }
 
+    pub fn flush_denormals(&mut self) {
+        for s in [&mut self.x1, &mut self.x2, &mut self.y1, &mut self.y2] {
+            if s.abs() < f64::MIN_POSITIVE || !s.is_finite() {
+                *s = 0.0;
+            }
+        }
+    }
+
     pub fn process(&mut self, buf: &mut [f32]) {
         for v in buf.iter_mut() {
             *v = self.tick(*v as f64) as f32;
         }
-        for s in [&mut self.x1, &mut self.x2, &mut self.y1, &mut self.y2] {
-            if s.abs() < f64::MIN_POSITIVE || !s.is_finite() {
-                *s = 0.0;
+        self.flush_denormals();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn corner_extreme_q_nao_gera_nan() {
+        for q in [0.001, 0.1, 1.0, 2.0, 10.0, 100.0] {
+            for kind in [BqType::LowShelf, BqType::HighShelf] {
+                let p = BqParams { kind, freq: 200.0, gain: 12.0, width: q, width_kind: Width::Q, corner: true };
+                let c = Coefs::new(&p, 48000.0);
+                let g = c.gain_at(1000.0, 48000.0);
+                assert!(g.is_finite(), "NaN em Q={q}");
             }
         }
     }

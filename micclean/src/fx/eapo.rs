@@ -7,7 +7,18 @@ use std::fmt::Write;
 use std::path::Path;
 
 fn num(s: &str) -> Option<f64> {
-    s.replace(',', ".").trim().parse().ok()
+    s.replace(',', ".").trim().parse::<f64>().ok().filter(|v| v.is_finite())
+}
+
+fn parse_preamp(rest: &str) -> Option<f64> {
+    let tok = rest.split('#').next().unwrap_or("").split_whitespace().next()?;
+    let tok = tok
+        .strip_suffix("dB")
+        .or_else(|| tok.strip_suffix("db"))
+        .or_else(|| tok.strip_suffix("DB"))
+        .or_else(|| tok.strip_suffix("Db"))
+        .unwrap_or(tok);
+    num(tok)
 }
 
 fn split_quoted(s: &str) -> Vec<String> {
@@ -112,9 +123,9 @@ fn import_into(path: &Path, out: &mut Vec<BlockCfg>, warn: &mut Vec<String>, dep
         let (cmd, rest) = (cmd.trim(), rest.trim());
         let mut add: Vec<(bool, Kind)> = Vec::new();
         let mut push = |enabled, kind| add.push((enabled, kind));
-        let mut res: Result<(), String> = (|| {
+        let res: Result<(), String> = (|| {
             match cmd {
-                "Preamp" => push(true, Kind::Preamp { gain_db: num(rest.trim_end_matches("dB")).ok_or("preamp inválido")? }),
+                "Preamp" => push(true, Kind::Preamp { gain_db: parse_preamp(rest).ok_or("preamp inválido")? }),
                 c if c.starts_with("Filter") => {
                     let (on, p) = parse_filter(rest)?;
                     push(on, Kind::Filter { p });
@@ -127,7 +138,7 @@ fn import_into(path: &Path, out: &mut Vec<BlockCfg>, warn: &mut Vec<String>, dep
                             nodes.push((v[0], v[1]));
                         }
                     }
-                    nodes.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+                    nodes.sort_by(|a, b| a.0.total_cmp(&b.0));
                     push(true, Kind::GraphicEq { mode: geq_mode(&nodes), nodes });
                 }
                 "LoudnessCorrection" => {
@@ -145,7 +156,7 @@ fn import_into(path: &Path, out: &mut Vec<BlockCfg>, warn: &mut Vec<String>, dep
                 "Delay" => {
                     let t: Vec<&str> = rest.split_whitespace().collect();
                     let v = t.first().and_then(|v| num(v)).ok_or("delay inválido")?;
-                    let ms = if t.get(1).is_some_and(|u| u.eq_ignore_ascii_case("samples")) { v * 1000.0 / 48000.0 } else { v };
+                    let ms = if t.get(1).is_some_and(|u| u.eq_ignore_ascii_case("samples")) { v * 1000.0 / crate::SR as f64 } else { v };
                     push(true, Kind::Delay { ms });
                 }
                 "Convolution" => {
@@ -189,7 +200,9 @@ fn import_into(path: &Path, out: &mut Vec<BlockCfg>, warn: &mut Vec<String>, dep
             for f in rest.split(';') {
                 let f = f.trim().trim_matches('"');
                 if !f.is_empty() {
-                    res = import_into(&dir.join(f), out, warn, depth + 1);
+                    if let Err(e) = import_into(&dir.join(f), out, warn, depth + 1) {
+                        warn.push(format!("linha {}: {e}", ln + 1));
+                    }
                 }
             }
         }
@@ -274,4 +287,29 @@ pub fn export(blocks: &[BlockCfg], base: &Path) -> String {
         s.push('\n');
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejeita_nan_e_preserva_avisos_include() {
+        let dir = std::env::temp_dir().join("ama_eapo_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let p = dir.join("cfg.txt");
+        std::fs::write(&p, "Preamp: -3.5 db # comentario\nGraphicEQ: 100 NaN; 200 1.5; 500 inf\nInclude: nao_existe_1.txt; nao_existe_2.txt\n").unwrap();
+        let (blocks, warn) = import(&p).unwrap();
+        assert_eq!(blocks.len(), 2);
+        match &blocks[0].kind {
+            Kind::Preamp { gain_db } => assert!((*gain_db + 3.5).abs() < 1e-9),
+            k => panic!("{k:?}"),
+        }
+        match &blocks[1].kind {
+            Kind::GraphicEq { nodes, .. } => assert_eq!(nodes, &vec![(200.0, 1.5)]),
+            k => panic!("{k:?}"),
+        }
+        assert_eq!(warn.len(), 2, "warn: {warn:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

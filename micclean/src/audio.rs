@@ -1,9 +1,53 @@
+use std::sync::{Arc, Condvar, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::{Acquire, Relaxed, Release}};
+use std::time::Duration;
 use wasapi::*;
 
 pub type Res<T> = Result<T, String>;
 
 fn e<E: std::fmt::Display>(x: E) -> String {
     x.to_string()
+}
+
+/// Sinalização para threads em espera dormirem sem polling.
+#[derive(Default)]
+pub struct Wake {
+    m: Mutex<()>,
+    cv: Condvar,
+}
+
+impl Wake {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn notify_all(&self) {
+        let _g = self.m.lock().unwrap();
+        self.cv.notify_all();
+    }
+
+    pub fn wait_while(&self, mut pred: impl FnMut() -> bool) {
+        let mut g = self.m.lock().unwrap();
+        while pred() {
+            g = self.cv.wait(g).unwrap();
+        }
+    }
+
+    pub fn wait_timeout_while(&self, dur: Duration, mut pred: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + dur;
+        let mut g = self.m.lock().unwrap();
+        while pred() {
+            let Some(rem) = deadline.checked_duration_since(std::time::Instant::now()) else { break };
+            if rem.is_zero() {
+                break;
+            }
+            let (ng, res) = self.cv.wait_timeout(g, rem).unwrap();
+            g = ng;
+            if res.timed_out() {
+                break;
+            }
+        }
+    }
 }
 
 pub fn com_init() {
@@ -78,11 +122,19 @@ pub fn default_id(dir: Direction) -> Option<String> {
 pub struct Mmcss(windows::Win32::Foundation::HANDLE);
 
 pub fn mmcss_pro_audio() -> Option<Mmcss> {
+    mmcss_pro_audio_with(false)
+}
+
+pub fn mmcss_pro_audio_critical() -> Option<Mmcss> {
+    mmcss_pro_audio_with(true)
+}
+
+fn mmcss_pro_audio_with(critical: bool) -> Option<Mmcss> {
     use windows::Win32::System::Threading::*;
     let mut idx = 0u32;
     unsafe {
         let h = AvSetMmThreadCharacteristicsW(windows::core::w!("Pro Audio"), &mut idx).ok()?;
-        let _ = AvSetMmThreadPriority(h, AVRT_PRIORITY_HIGH);
+        let _ = AvSetMmThreadPriority(h, if critical { AVRT_PRIORITY_CRITICAL } else { AVRT_PRIORITY_HIGH });
         Some(Mmcss(h))
     }
 }
@@ -175,6 +227,50 @@ pub fn open_capture(dev: &Device, loopback: bool, raw: bool, channels: usize) ->
     }
 }
 
+/// Captura compartilhada com o menor período do motor (IAudioClient3). Só no formato nativo de 48 kHz float.
+pub fn open_capture_fast(dev: &Device, raw: bool) -> Res<Capture> {
+    let name = dev.get_friendlyname().unwrap_or_default();
+    let mut try_raw = raw;
+    loop {
+        let mut client = dev.get_iaudioclient().map_err(e)?;
+        if try_raw {
+            let p = AudioClientProperties::new().set_option(StreamOption::Raw);
+            if client.set_properties(p).is_err() {
+                try_raw = false;
+                continue;
+            }
+        }
+        let f = client.get_mixformat().map_err(e)?;
+        if f.get_samplespersec() != crate::SR as u32 || f.get_bitspersample() != 32 || f.get_subformat().map_err(e)? != SampleType::Float {
+            return Err(format!("'{name}' não está em 48 kHz float"));
+        }
+        let p = client.get_shared_mode_engine_period(&f).map_err(e)?;
+        let fund = p.fundamental.max(1);
+        let period = (p.min.max(96).div_ceil(fund) * fund).min(p.max);
+        if period >= p.default {
+            return Err(format!("'{name}' não aceita período menor"));
+        }
+        match client.initialize_shared_audio_stream(&f, TimingMode::Events, period) {
+            Ok(()) => {}
+            Err(err) if try_raw => {
+                crate::log!("RAW recusado em '{name}' ({err}), usando modo normal");
+                try_raw = false;
+                continue;
+            }
+            Err(err) => return Err(format!("captura rápida '{name}': {err}")),
+        }
+        let ev = client.set_get_eventhandle().map_err(e)?;
+        let cap = client.get_audiocaptureclient().map_err(e)?;
+        let frames = client.get_buffer_size().map_err(e)? as usize;
+        let channels = f.get_nchannels() as usize;
+        crate::log!(
+            "captura rápida: '{name}' raw={try_raw} ch={channels} buffer={frames} período={period} ({:.2} ms)",
+            period as f64 * 1000.0 / crate::SR as f64
+        );
+        return Ok(Capture { client, cap, ev, channels, name, buf: vec![0.0; (frames + 4096) * channels], int: 0, raw: vec![] });
+    }
+}
+
 impl Capture {
     /// Lê todos os pacotes; chama `f` com amostras mono. Retorna (frames, descontinuidade).
     pub fn drain(&mut self, mut f: impl FnMut(&[f32])) -> Res<(usize, bool)> {
@@ -199,15 +295,20 @@ impl Capture {
                 self.cap.read_from_device(bytes).map_err(e)?
             } else {
                 let w = self.int;
-                let r = self.cap.read_from_device(&mut self.raw[..need * w]).map_err(e)?;
-                for (k, v) in self.buf[..r.0 as usize * self.channels].iter_mut().enumerate() {
-                    *v = int_to_f32(&self.raw[k * w..k * w + w], w);
+                let (got, info) = self.cap.read_from_device(&mut self.raw[..need * w]).map_err(e)?;
+                if !info.flags.silent {
+                    for (k, v) in self.buf[..got as usize * self.channels].iter_mut().enumerate() {
+                        *v = int_to_f32(&self.raw[k * w..k * w + w], w);
+                    }
                 }
-                r
+                (got, info)
             };
             disc |= info.flags.data_discontinuity;
             let got = got as usize;
-            if self.channels == 1 {
+            if info.flags.silent {
+                self.buf[..got].fill(0.0);
+                f(&self.buf[..got], info.timestamp);
+            } else if self.channels == 1 {
                 f(&self.buf[..got], info.timestamp);
             } else {
                 let ch = self.channels;
@@ -262,10 +363,11 @@ pub fn open_render_fast(dev: &Device) -> Res<Render> {
         return Err(format!("'{name}' não está em 48 kHz float"));
     }
     let p = client.get_shared_mode_engine_period(&f).map_err(e)?;
-    if p.min >= p.default {
+    let fund = p.fundamental.max(1);
+    let period = (p.min.max(96).div_ceil(fund) * fund).min(p.max);
+    if period >= p.default {
         return Err(format!("'{name}' não aceita período menor"));
     }
-    let period = p.min.max(96).div_ceil(p.fundamental.max(1)) * p.fundamental.max(1);
     client.initialize_shared_audio_stream(&f, TimingMode::Events, period).map_err(e)?;
     let ev = client.set_get_eventhandle().map_err(e)?;
     let rend = client.get_audiorenderclient().map_err(e)?;
@@ -324,32 +426,44 @@ impl Render {
     /// Escreve `n` frames gerados por `f` (mono -> todos os canais).
     pub fn write_mono(&mut self, mono: &[f32]) -> Res<()> {
         let n = mono.len();
+        if n == 0 {
+            return Ok(());
+        }
         let ch = self.channels;
+        if n * ch > self.buf.len() {
+            return Err("escrita maior que o buffer".into());
+        }
         for (i, &s) in mono.iter().enumerate() {
             for c in 0..ch {
                 self.buf[i * ch + c] = s;
             }
         }
-        self.flush(n)
+        self.flush(n, None)
     }
 
-    fn flush(&mut self, n: usize) -> Res<()> {
+    fn flush(&mut self, n: usize, flags: Option<BufferFlags>) -> Res<()> {
         let ch = self.channels;
         if self.int == 0 {
             let bytes = unsafe { std::slice::from_raw_parts(self.buf.as_ptr() as *const u8, n * ch * 4) };
-            return self.rend.write_to_device(bytes, None).map_err(e);
+            return self.rend.write_to_device(bytes, flags).map_err(e);
         }
         let w = self.int;
         for k in 0..n * ch {
             f32_to_int(self.buf[k], &mut self.raw[k * w..k * w + w], w);
         }
-        self.rend.write_to_device(&self.raw[..n * ch * w], None).map_err(e)
+        self.rend.write_to_device(&self.raw[..n * ch * w], flags).map_err(e)
     }
 
     pub fn write_silence(&mut self, n: usize) -> Res<()> {
+        if n == 0 {
+            return Ok(());
+        }
         let ch = self.channels;
+        if n * ch > self.buf.len() {
+            return Err("escrita maior que o buffer".into());
+        }
         self.buf[..n * ch].fill(0.0);
-        self.flush(n)
+        self.flush(n, Some(BufferFlags { data_discontinuity: false, silent: true, timestamp_error: false }))
     }
 
     pub fn latency_hns(&self) -> i64 {
@@ -358,38 +472,47 @@ impl Render {
 }
 
 /// Conta eventos de dispositivo (entrou, saiu, mudou estado ou padrão).
-pub static HOTPLUG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static HOTPLUG: AtomicU64 = AtomicU64::new(0);
+static HOTPLUG_OK: AtomicBool = AtomicBool::new(false);
 
 pub fn hotplug() -> u64 {
-    HOTPLUG.load(std::sync::atomic::Ordering::Relaxed)
+    HOTPLUG.load(Relaxed)
+}
+
+pub fn hotplug_ok() -> bool {
+    HOTPLUG_OK.load(Acquire)
 }
 
 mod notify {
+    use std::sync::Arc;
     use std::sync::atomic::Ordering::Relaxed;
     use windows::Win32::Foundation::PROPERTYKEY;
     use windows::Win32::Media::Audio::*;
     use windows::core::{PCWSTR, Result, implement};
 
     #[implement(IMMNotificationClient)]
-    pub struct Client;
+    pub struct Client {
+        pub wake: Arc<super::Wake>,
+    }
 
-    fn bump() -> Result<()> {
+    fn bump(wake: &super::Wake) -> Result<()> {
         super::HOTPLUG.fetch_add(1, Relaxed);
+        wake.notify_all();
         Ok(())
     }
 
     impl IMMNotificationClient_Impl for Client_Impl {
         fn OnDeviceStateChanged(&self, _: &PCWSTR, _: DEVICE_STATE) -> Result<()> {
-            bump()
+            bump(&self.wake)
         }
         fn OnDeviceAdded(&self, _: &PCWSTR) -> Result<()> {
-            bump()
+            bump(&self.wake)
         }
         fn OnDeviceRemoved(&self, _: &PCWSTR) -> Result<()> {
-            bump()
+            bump(&self.wake)
         }
         fn OnDefaultDeviceChanged(&self, _: EDataFlow, role: ERole, _: &PCWSTR) -> Result<()> {
-            if role == eConsole { bump() } else { Ok(()) }
+            if role == eConsole { bump(&self.wake) } else { Ok(()) }
         }
         fn OnPropertyValueChanged(&self, _: &PCWSTR, _: &PROPERTYKEY) -> Result<()> {
             Ok(())
@@ -398,21 +521,21 @@ mod notify {
 }
 
 /// Registra o aviso de dispositivos do Windows e mantém até `stop`.
-pub fn watch_devices(stop: &std::sync::atomic::AtomicBool) {
+pub fn watch_devices(stop: &AtomicBool, wake: &Arc<Wake>) {
     use windows::Win32::Media::Audio::*;
     use windows::Win32::System::Com::*;
     com_init();
     let r = unsafe {
         CoCreateInstance::<_, IMMDeviceEnumerator>(&MMDeviceEnumerator, None, CLSCTX_ALL).and_then(|en| {
-            let c: IMMNotificationClient = notify::Client.into();
+            let c: IMMNotificationClient = notify::Client { wake: wake.clone() }.into();
             en.RegisterEndpointNotificationCallback(&c).map(|_| (en, c))
         })
     };
     match r {
         Ok((en, c)) => {
-            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            }
+            HOTPLUG_OK.store(true, Release);
+            wake.wait_while(|| !stop.load(Acquire));
+            HOTPLUG_OK.store(false, Release);
             unsafe {
                 let _ = en.UnregisterEndpointNotificationCallback(&c);
             }

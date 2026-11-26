@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::{Acquire, Relaxed}};
 
 #[derive(Default)]
 pub struct Stats {
@@ -7,6 +7,10 @@ pub struct Stats {
     /// O render do CABLE ficou vazio antes de escrevermos (o Windows tocou silêncio).
     pub out_starves: AtomicU64,
     pub low_latency: AtomicBool,
+    /// Modelo efetivamente ativo no Pipeline (atualizado após swap_model).
+    pub active_ll: AtomicBool,
+    /// Se há um bloco AEC habilitado na cadeia atual.
+    pub aec_active: AtomicBool,
     /// Período do render da saída e da escuta em frames (0 = desconectado).
     pub out_period: AtomicU32,
     pub mon_period: AtomicU32,
@@ -54,11 +58,18 @@ pub const MAX_BLOCKS: usize = 32;
 
 /// (id, quanto o bloco muda o nível em dB).
 pub fn block_meters(st: &Stats) -> Vec<(u32, f32)> {
-    let n = (st.nblocks.load(Relaxed) as usize).min(MAX_BLOCKS);
-    st.blocks[..n].iter().map(|a| {
+    let mut v = Vec::new();
+    read_block_meters(st, |id, db| v.push((id, db)));
+    v
+}
+
+/// Lê os medidores por bloco sem alocar.
+pub fn read_block_meters(st: &Stats, mut f: impl FnMut(u32, f32)) {
+    let n = (st.nblocks.load(Acquire) as usize).min(MAX_BLOCKS);
+    for a in &st.blocks[..n] {
         let v = a.load(Relaxed);
-        ((v >> 32) as u32, f32::from_bits(v as u32))
-    }).collect()
+        f((v >> 32) as u32, f32::from_bits(v as u32));
+    }
 }
 
 pub fn peak_max(a: &AtomicU32, x: &[f32]) {

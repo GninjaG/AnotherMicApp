@@ -56,10 +56,12 @@ pub fn out_target_ms(out_ms: f64, low_latency: bool) -> f64 {
     if low_latency { out_ms + 4.0 } else { out_ms }
 }
 
-/// Alvo do buffer de saída para um render com `period` frames: nunca menos que 1 período.
+/// Alvo do buffer de saída para um render com `period` frames: nunca menos que 1 período (+ margem para períodos longos).
 /// O alvo vale para o ponto mais baixo do buffer, logo antes de chegar o próximo bloco de 10 ms.
 pub fn out_target_for(out_ms: f64, low_latency: bool, period: u32) -> f64 {
-    out_target_ms(out_ms, low_latency).max(period as f64 * 1000.0 / crate::SR as f64)
+    let p_ms = period as f64 * 1000.0 / crate::SR as f64;
+    let margin = if period >= 240 { 2.0 } else { 0.0 };
+    out_target_ms(out_ms, low_latency).max(p_ms + margin)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -237,9 +239,13 @@ pub fn exe_dir() -> PathBuf {
 
 /// Pasta de dados do AMA (%APPDATA%\AMA): ajustes, presets, log e a subpasta VST.
 pub fn data_dir() -> PathBuf {
-    let d = std::env::var_os("APPDATA").map(|a| PathBuf::from(a).join("AMA")).unwrap_or_else(exe_dir);
-    let _ = std::fs::create_dir_all(d.join("VST"));
-    d
+    static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let d = std::env::var_os("APPDATA").map(|a| PathBuf::from(a).join("AMA")).unwrap_or_else(exe_dir);
+        let _ = std::fs::create_dir_all(d.join("VST"));
+        d
+    })
+    .clone()
 }
 
 impl Config {

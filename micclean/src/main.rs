@@ -162,7 +162,7 @@ fn main() {
         renderer: eframe::Renderer::Glow,
         ..Default::default()
     };
-    let boot = Boot { cfg, cfg_path, base, engine: engine.clone(), shared: shared.clone(), store, preset, vst, errs };
+    let boot = Boot { cfg, cfg_path, base, engine: engine.clone(), shared: shared.clone(), store, preset, vst, errs, start_hidden };
     let r = eframe::run_native("AMA", opts, Box::new(move |cc| Ok(Box::new(AmaApp::new(cc, boot)))));
     if let Err(e) = r {
         log!("janela: {e}");

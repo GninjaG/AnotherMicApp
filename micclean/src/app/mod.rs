@@ -42,15 +42,19 @@ pub struct Shared {
 
 pub fn ctl_thread(engine: Arc<Engine>, sh: Arc<Shared>) {
     micclean::audio::com_init();
+    let mut vol = sys::VolWatcher::default();
     let mut last = f64::NAN;
     while !sh.stop.load(Relaxed) {
         engine.collect();
-        if let Some(v) = sys::master_volume_db() {
-            if !(v - last).abs().le(&0.05) {
-                last = v;
-                sh.vol_db.set(v);
-                for &(id, a, b, c) in sh.loud.lock().unwrap().iter() {
-                    engine.send(Cmd::Loud(id, loudness::coefs(a, b, c, v, SR as f64)));
+        let has_loud = !sh.loud.lock().unwrap().is_empty();
+        if has_loud {
+            if let Some(v) = vol.get() {
+                if !(v - last).abs().le(&0.05) {
+                    last = v;
+                    sh.vol_db.set(v);
+                    for &(id, a, b, c) in sh.loud.lock().unwrap().iter() {
+                        engine.send(Cmd::Loud(id, loudness::coefs(a, b, c, v, SR as f64)));
+                    }
                 }
             }
         }
@@ -94,6 +98,7 @@ pub struct AmaApp {
     /// VSTs fora da cadeia: a thread de áudio ainda pode ter uma cópia; liberados aqui, na thread da janela.
     retired: Vec<(f64, Arc<VstPlugin>)>,
     meters: BTreeMap<u32, f32>,
+    meter_times: BTreeMap<u32, f64>,
     /// Preset escolhido à mão enquanto um preset por programa está ativo.
     auto_from: Option<String>,
     wizard: Option<wizard::Wizard>,
@@ -120,6 +125,8 @@ pub struct AmaApp {
     toast: Option<(String, f64, bool)>,
     quitting: bool,
     stopped: bool,
+    hidden: bool,
+    was_concealed: bool,
     scan: Option<Vec<PathBuf>>,
     last_t: f64,
 }
@@ -134,6 +141,7 @@ pub struct Boot {
     pub preset: Preset,
     pub vst: BTreeMap<u32, Arc<VstPlugin>>,
     pub errs: Vec<(u32, String)>,
+    pub start_hidden: bool,
 }
 
 impl AmaApp {
@@ -171,6 +179,7 @@ impl AmaApp {
             dirty_preset: None,
             retired: Vec::new(),
             meters: BTreeMap::new(),
+            meter_times: BTreeMap::new(),
             dirty_cfg: false,
             pending: BTreeMap::new(),
             ask_close: false,
@@ -179,6 +188,8 @@ impl AmaApp {
             toast: None,
             quitting: false,
             stopped: false,
+            hidden: b.start_hidden,
+            was_concealed: b.start_hidden,
             scan: None,
             last_t: 0.0,
             auto_from: None,
@@ -205,7 +216,7 @@ impl AmaApp {
         if app.cfg.app.setup_pending {
             app.wizard = Some(Default::default());
         }
-        app.sys.focus_on.store(app.cfg.app.auto_preset, Relaxed);
+        app.sys.set_focus_watch(app.cfg.app.auto_preset);
         app.apply_hotkeys();
         if let Some(e) = app.settings.hotkey_err.clone() {
             app.toast = Some((tr!("Atalho: {e}", "Hotkey: {e}"), 0.0, true));
@@ -335,24 +346,40 @@ impl AmaApp {
         self.dirty_cfg = false;
     }
 
-    /// Leitura suavizada do medidor por bloco.
-    fn block_meters(&mut self) -> BTreeMap<u32, f32> {
-        let mut m = BTreeMap::new();
-        if self.st().bypass.load(Relaxed) {
+    /// Leitura suavizada do medidor por bloco (sem alocar).
+    fn update_block_meters(&mut self) {
+        let st = &self.engine.stats;
+        if st.bypass.load(Relaxed) || st.mute.load(Relaxed) {
             self.meters.clear();
-            return m;
+            self.meter_times.clear();
+            return;
         }
-        for (id, v) in micclean::stats::block_meters(self.st()) {
-            let prev = self.meters.get(&id).copied().filter(|p| p.is_finite());
-            let v = match (prev, v.is_finite()) {
-                (Some(p), true) => p + 0.2 * (v - p),
-                (_, true) => v,
-                (p, false) => p.unwrap_or(f32::NAN),
-            };
-            m.insert(id, v);
-        }
-        self.meters = m.clone();
-        m
+        let now = self.last_t;
+        let mut seen = [0u32; micclean::stats::MAX_BLOCKS];
+        let mut n_seen = 0usize;
+        let meters = &mut self.meters;
+        let meter_times = &mut self.meter_times;
+        micclean::stats::read_block_meters(st, |id, v| {
+            if n_seen < seen.len() {
+                seen[n_seen] = id;
+                n_seen += 1;
+            }
+            if v.is_finite() {
+                let prev = meters.get(&id).copied().filter(|p| p.is_finite());
+                let smoothed = match prev {
+                    Some(p) => p + 0.2 * (v - p),
+                    None => v,
+                };
+                meters.insert(id, smoothed);
+                meter_times.insert(id, now);
+            } else if meter_times.get(&id).is_some_and(|&t| now - t > 2.0) {
+                meters.remove(&id);
+                meter_times.remove(&id);
+            }
+        });
+        let seen = &seen[..n_seen];
+        meters.retain(|id, _| seen.contains(id));
+        meter_times.retain(|id, _| seen.contains(id));
     }
 
     fn retire(&mut self, p: Arc<VstPlugin>) {
@@ -379,7 +406,10 @@ impl AmaApp {
 
     /// Programa em foco mudou: entra no preset dele ou volta ao escolhido à mão.
     fn on_focus(&mut self, exe: &str) {
-        let own = std::env::current_exe().ok().and_then(|p| p.file_name().map(|f| f.to_string_lossy().to_lowercase()));
+        static OWN: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+        let own = OWN.get_or_init(|| {
+            std::env::current_exe().ok().and_then(|p| p.file_name().map(|f| f.to_string_lossy().to_lowercase()))
+        });
         if !self.cfg.app.auto_preset || own.as_deref() == Some(exe) {
             return;
         }
@@ -612,6 +642,7 @@ impl AmaApp {
         self.save_preset();
         self.save_cfg();
         self.close_all_editors();
+        self.sys.stop_focus();
         self.shared.stop.store(true, Relaxed);
         self.engine.stop();
         self.engine.collect();
@@ -634,7 +665,15 @@ impl AmaApp {
 
     fn poll_update(&mut self, ctx: &egui::Context) {
         let Some(rx) = &self.upd_rx else { return };
-        let Ok(m) = rx.try_recv() else { return };
+        let m = match rx.try_recv() {
+            Ok(m) => m,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.upd_rx = None;
+                self.upd = Upd::None;
+                return;
+            }
+        };
         self.upd_rx = None;
         match m {
             UpdMsg::Found(r) => self.upd = Upd::Available(r),
@@ -697,6 +736,7 @@ impl AmaApp {
     }
 
     fn to_tray(&mut self, ctx: &egui::Context) {
+        self.hidden = true;
         self.save_preset();
         sys::hide_window(ctx);
     }
@@ -762,7 +802,7 @@ impl AmaApp {
                 ui.add_space(6.0);
                 let mon = self.st().monitor.load(Relaxed);
                 if pill(ui, t!("Escuta", "Monitor"), mon, ACCENT_DIM).on_hover_text(t!("Ouvir o mic processado no dispositivo de escuta", "Hear the processed mic on the monitor device")).clicked() {
-                    self.st().monitor.store(!mon, Relaxed);
+                    self.engine.set_monitor(!mon);
                 }
                 let by = self.st().bypass.load(Relaxed);
                 if pill(ui, "Bypass", by, Color32::from_rgb(0x9a, 0x6a, 0x22)).on_hover_text(tr!("Mic sem efeitos ({})", "Mic without effects ({})", self.cfg.app.hotkey_bypass)).clicked() {
@@ -787,8 +827,8 @@ impl AmaApp {
         egui::ScrollArea::vertical().max_height(avail).auto_shrink([false, false]).show(ui, |ui| {
             fade_on_change(ui, egui::Id::unique("chain-fade"), egui::Id::unique(&self.preset.name).value());
             ui.spacing_mut().item_spacing.y = 8.0;
-            let meters = self.block_meters();
-            let cx = cards::Ctx { errs: &self.errs, vst: &self.vst, sel: self.sel, vol_db: self.shared.vol_db.get(), meters: &meters };
+            self.update_block_meters();
+            let cx = cards::Ctx { errs: &self.errs, vst: &self.vst, sel: self.sel, vol_db: self.shared.vol_db.get(), meters: &self.meters };
             edits = self.cards.show(ui, &mut self.preset.blocks, &cx);
             if self.preset.blocks.is_empty() {
                 ui.add_space(30.0);
@@ -908,10 +948,11 @@ impl AmaApp {
         };
         let d = &self.cfg.devices;
         let mon = st.monitor.load(Relaxed);
+        let aec_on = st.aec_active.load(Relaxed);
         ui.columns(2, |c| {
             dot(&mut c[0], st.mic_ok.load(Relaxed), false, t!("Microfone", "Microphone"), &d.mic);
             dot(&mut c[0], st.out_ok.load(Relaxed), false, t!("Saída", "Output"), &d.output);
-            dot(&mut c[0], st.ref_ok.load(Relaxed), false, t!("Referência", "Reference"), &d.speakers);
+            dot(&mut c[0], st.ref_ok.load(Relaxed), !aec_on, t!("Referência", "Reference"), &d.speakers);
             dot(&mut c[0], st.mon_ok.load(Relaxed), !mon, t!("Escuta", "Monitor"), &d.monitor);
             let kv = |ui: &mut egui::Ui, k: &str, v: String| {
                 ui.horizontal(|ui| {
@@ -998,12 +1039,19 @@ impl AmaApp {
                     self.sync_vst_state();
                     self.preset.name = name.clone();
                     if let Err(e) = self.store.rename(&old, &self.preset) {
+                        self.preset.name = old;
                         self.note(e, true);
+                    } else {
+                        for r in &mut self.cfg.app.program_presets {
+                            if r.preset == old {
+                                r.preset = name.clone();
+                            }
+                        }
+                        self.cfg.app.preset = name;
+                        self.dirty_cfg = true;
+                        self.names = self.store.list();
+                        self.sync_tray();
                     }
-                    self.cfg.app.preset = name;
-                    self.dirty_cfg = true;
-                    self.names = self.store.list();
-                    self.sync_tray();
                 }
             }
         }
@@ -1123,7 +1171,7 @@ impl AmaApp {
                     self.wizard = Some(Default::default());
                 }
                 SetEdit::AutoPreset => {
-                    self.sys.focus_on.store(self.cfg.app.auto_preset, Relaxed);
+                    self.sys.set_focus_watch(self.cfg.app.auto_preset);
                     if !self.cfg.app.auto_preset {
                         self.leave_auto();
                     }
@@ -1147,10 +1195,14 @@ impl eframe::App for AmaApp {
     fn logic(&mut self, ctx: &egui::Context, _f: &mut eframe::Frame) {
         self.last_t = ctx.input(|i| i.time);
         let now = self.last_t;
-        self.retired.retain(|(t, _)| now - *t < 2.0);
+        self.engine.collect();
+        self.retired.retain(|(t, p)| now - *t < 2.0 || Arc::strong_count(p) > 1);
         while let Ok(ev) = self.sys.rx.try_recv() {
             match ev {
-                SysEv::Show => sys::show_window(self.hwnd, ctx),
+                SysEv::Show => {
+                    self.hidden = false;
+                    sys::show_window(self.hwnd, ctx);
+                }
                 SysEv::Quit => self.quit(ctx),
                 SysEv::Mute => self.toggle(0),
                 SysEv::Bypass => self.toggle(1),
@@ -1220,20 +1272,45 @@ impl eframe::App for AmaApp {
 
     fn ui(&mut self, ui: &mut egui::Ui, _f: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        let concealed = self.hidden || ctx.input(|i| i.viewport().minimized.unwrap_or(false));
+        if concealed {
+            self.was_concealed = true;
+            let wait_ms = if self.dirty_preset.is_some() || !self.pending.is_empty() || !self.retired.is_empty() {
+                200
+            } else {
+                1000
+            };
+            ctx.request_repaint_after(std::time::Duration::from_millis(wait_ms));
+            return;
+        }
         let dt = ctx.input(|i| i.stable_dt).min(0.1);
         if !self.stopped {
+            let drain_all = self.was_concealed;
+            self.was_concealed = false;
             let n = {
                 let mut c = self.engine.spec.lock().unwrap();
-                let n = c.slots().min(self.spec_tmp.len());
-                if let Ok(ch) = c.read_chunk(n) {
-                    let (a, b) = ch.as_slices();
-                    self.spec_tmp[..a.len()].copy_from_slice(a);
-                    self.spec_tmp[a.len()..a.len() + b.len()].copy_from_slice(b);
-                    ch.commit_all();
+                if drain_all {
+                    let avail = c.slots();
+                    if avail > 0 {
+                        if let Ok(ch) = c.read_chunk(avail) {
+                            ch.commit_all();
+                        }
+                    }
+                    0
+                } else {
+                    let n = c.slots().min(self.spec_tmp.len());
+                    if let Ok(ch) = c.read_chunk(n) {
+                        let (a, b) = ch.as_slices();
+                        self.spec_tmp[..a.len()].copy_from_slice(a);
+                        self.spec_tmp[a.len()..a.len() + b.len()].copy_from_slice(b);
+                        ch.commit_all();
+                    }
+                    n
                 }
-                n
             };
-            self.spec.push(&self.spec_tmp[n.saturating_sub(graph::NFFT)..n]);
+            if n > 0 {
+                self.spec.push(&self.spec_tmp[n.saturating_sub(graph::NFFT)..n]);
+            }
             if self.cfg.app.show_spectrum {
                 self.spec.update();
             }

@@ -1,6 +1,6 @@
 use crate::FRAME;
 use df::tract::{DfParams, DfTract, RuntimeParams};
-use ndarray::Array2;
+use ndarray::{Array2, ArrayView2};
 use sonora::config::{EchoCanceller, EchoCanceller3Config};
 use sonora::{AudioProcessing, Config as ApmConfig, StreamConfig};
 use std::time::Instant;
@@ -81,7 +81,6 @@ impl Default for Aec {
 
 pub struct Dfn {
     m: DfTract,
-    inb: Array2<f32>,
     outb: Array2<f32>,
 }
 
@@ -99,7 +98,7 @@ impl Dfn {
         let params = if ll { DfParams::from_bytes(LL).map_err(|e| format!("{e:#}"))? } else { DfParams::default() };
         let m = DfTract::new(params, &rp).map_err(|e| format!("{e:#}"))?;
         assert_eq!(m.hop_size, FRAME);
-        Ok(Self { m, inb: Array2::zeros((1, FRAME)), outb: Array2::zeros((1, FRAME)) })
+        Ok(Self { m, outb: Array2::zeros((1, FRAME)) })
     }
 
     pub fn set_atten(&mut self, db: f32) {
@@ -112,8 +111,8 @@ impl Dfn {
     }
 
     pub fn process(&mut self, x: &mut [f32]) {
-        self.inb.as_slice_mut().unwrap().copy_from_slice(x);
-        if self.m.process(self.inb.view(), self.outb.view_mut()).is_ok() {
+        let inb = ArrayView2::from_shape((1, x.len()), x).unwrap();
+        if self.m.process(inb, self.outb.view_mut()).is_ok() {
             x.copy_from_slice(self.outb.as_slice().unwrap());
         }
     }
@@ -144,6 +143,9 @@ impl Limiter {
             } else {
                 *s = v;
             }
+        }
+        if self.env < f32::MIN_POSITIVE || !self.env.is_finite() {
+            self.env = 0.0;
         }
         limited
     }
@@ -181,6 +183,11 @@ impl DcBlock {
             self.y1 = y;
             *v = y as f32;
         }
+        for s in [&mut self.x1, &mut self.y1] {
+            if s.abs() < f64::MIN_POSITIVE || !s.is_finite() {
+                *s = 0.0;
+            }
+        }
     }
 }
 
@@ -195,6 +202,7 @@ pub struct Pipeline {
     pub chain: Box<Chain>,
     pub bypass: bool,
     pub mute: bool,
+    was_muted: bool,
     tuning: String,
     atten: f32,
     post: f32,
@@ -292,6 +300,7 @@ impl Pipeline {
             chain,
             bypass: false,
             mute: false,
+            was_muted: false,
             tuning,
             atten,
             post,
@@ -404,14 +413,30 @@ impl Pipeline {
         let t0 = Instant::now();
         let mut t = Times::default();
         t.nan = sanitize(x);
+        if self.mute {
+            if !self.was_muted {
+                let fade = (FRAME / 2).min(x.len());
+                for (i, v) in x[..fade].iter_mut().enumerate() {
+                    *v *= 1.0 - (i + 1) as f32 / fade as f32;
+                }
+                x[fade..].fill(0.0);
+                self.was_muted = true;
+            } else {
+                x.fill(0.0);
+            }
+            t.total_ns = t0.elapsed().as_nanos() as u64;
+            return t;
+        }
+        let unmuting = self.was_muted;
+        self.was_muted = false;
         self.dc.process(x);
         self.refb.copy_from_slice(&reference[..FRAME]);
         t.nan |= sanitize(&mut self.refb);
         if !self.bypass {
             let Pipeline { aec, dfn, chain, refb, tuning, atten, post, resets, ll, .. } = self;
+            let mut cur_e = energy(x);
             for s in chain.slots.iter_mut().filter(|s| s.enabled) {
-                let ein = energy(x);
-                match &mut s.fx {
+                let modified = match &mut s.fx {
                     Fx::Aec => {
                         let a = Instant::now();
                         aec.process(x, refb);
@@ -421,6 +446,7 @@ impl Pipeline {
                             *resets += 1;
                         }
                         t.aec_ns += a.elapsed().as_nanos() as u64;
+                        true
                     }
                     Fx::Denoise => {
                         let a = Instant::now();
@@ -433,30 +459,99 @@ impl Pipeline {
                             *resets += 1;
                         }
                         t.dfn_ns += a.elapsed().as_nanos() as u64;
+                        true
                     }
-                    Fx::Gain(g) => x.iter_mut().for_each(|v| *v *= *g),
-                    Fx::Bq(b) => b.process(x),
-                    Fx::Conv(c) => c.process(x),
-                    Fx::Loud(l) => l.process(x),
-                    Fx::Delay(d) => d.process(x),
-                    Fx::Lim(l) => t.limited |= l.process(x),
-                    Fx::Comp(c) => c.process(x),
-                    Fx::DeEss(d) => d.process(x),
-                    Fx::Vst(p, io) => p.process(io, x),
-                    Fx::Off => {}
-                }
-                s.e.0 += ein;
-                s.e.1 += energy(x);
+                    Fx::Gain(g) => {
+                        x.iter_mut().for_each(|v| *v *= *g);
+                        true
+                    }
+                    Fx::Bq(b) => {
+                        b.process(x);
+                        true
+                    }
+                    Fx::Conv(c) => {
+                        c.process(x);
+                        true
+                    }
+                    Fx::Loud(l) => {
+                        l.process(x);
+                        true
+                    }
+                    Fx::Delay(d) => {
+                        d.process(x);
+                        true
+                    }
+                    Fx::Lim(l) => {
+                        t.limited |= l.process(x);
+                        true
+                    }
+                    Fx::Comp(c) => {
+                        c.process(x);
+                        true
+                    }
+                    Fx::DeEss(d) => {
+                        d.process(x);
+                        true
+                    }
+                    Fx::Vst(p, io) => {
+                        p.process(io, x);
+                        true
+                    }
+                    Fx::Off => false,
+                };
+                let next_e = if modified { energy(x) } else { cur_e };
+                s.e.0 += cur_e;
+                s.e.1 += next_e;
+                cur_e = next_e;
             }
             t.nan |= sanitize(x);
         }
-        for v in x.iter_mut() {
-            *v = v.clamp(-1.0, 1.0);
-        }
-        if self.mute {
-            x.fill(0.0);
+        if unmuting {
+            let n = x.len();
+            for (i, v) in x.iter_mut().enumerate() {
+                *v = (*v * ((i + 1) as f32 / n as f32)).clamp(-1.0, 1.0);
+            }
+        } else {
+            for v in x.iter_mut() {
+                *v = v.clamp(-1.0, 1.0);
+            }
         }
         t.total_ns = t0.elapsed().as_nanos() as u64;
         t
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mute_atalha_cadeia_e_desmuta_suave() {
+        let p = Preset {
+            name: "m".into(),
+            blocks: vec![BlockCfg { id: 1, enabled: true, kind: Kind::Preamp { gain_db: 6.0 } }],
+        };
+        let mut vst = Default::default();
+        let mut bld = Builder { vst: &mut vst, vol_db: 0.0, base: std::path::Path::new(".") };
+        let (chain, _) = build_chain(&p, &mut bld);
+        let mut pipe = Pipeline::new(&p, chain).unwrap();
+        let refz = [0.0f32; FRAME];
+        let mut f = [0.5f32; FRAME];
+        pipe.mute = true;
+        pipe.process(&mut f, &refz);
+        assert_eq!(f[FRAME - 1], 0.0);
+        let mut f2 = [0.5f32; FRAME];
+        pipe.process(&mut f2, &refz);
+        assert!(f2.iter().all(|&v| v == 0.0));
+        pipe.mute = false;
+        let mut f3 = [0.0f32; FRAME];
+        for (i, v) in f3.iter_mut().enumerate() {
+            *v = 0.25 * (2.0 * std::f32::consts::PI * 1000.0 * i as f32 / crate::SR as f32).sin();
+        }
+        pipe.process(&mut f3, &refz);
+        assert!(f3[0].abs() < 0.02);
+        let tail_peak = f3[FRAME / 2..].iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        assert!(tail_peak > 0.35, "tail_peak={tail_peak}");
+        assert!(f3.iter().all(|v| v.is_finite()));
     }
 }

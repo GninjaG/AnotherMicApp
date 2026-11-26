@@ -152,16 +152,22 @@ impl VstPlugin {
         unsafe {
             let wp = wide(&path.to_string_lossy());
             let lib = LoadLibraryW(PCWSTR(wp.as_ptr())).map_err(|e| format!("não carregou (precisa ser VST2 64 bits): {e}"))?;
-            let f = GetProcAddress(lib, PCSTR(c"VSTPluginMain".as_ptr() as *const u8))
+            let Some(f) = GetProcAddress(lib, PCSTR(c"VSTPluginMain".as_ptr() as *const u8))
                 .or_else(|| GetProcAddress(lib, PCSTR(c"main".as_ptr() as *const u8)))
-                .ok_or("a DLL não é um plugin VST2")?;
+            else {
+                let _ = FreeLibrary(lib);
+                return Err("a DLL não é um plugin VST2".into());
+            };
             let main: MainFn = std::mem::transmute(f);
             let eff = main(host_cb);
             if eff.is_null() || (*eff).magic != MAGIC {
+                let _ = FreeLibrary(lib);
                 return Err("o plugin não inicializou".into());
             }
             let e = &*eff;
             if e.flags & FLAG_CAN_REPLACING == 0 {
+                (e.dispatcher)(eff, EFF_CLOSE, 0, 0, std::ptr::null_mut(), 0.0);
+                let _ = FreeLibrary(lib);
                 return Err("plugin sem processReplacing (não suportado)".into());
             }
             let changed = Arc::new(AtomicBool::new(false));
@@ -313,7 +319,7 @@ impl VstPlugin {
 
     /// Processa um quadro mono (thread de áudio). Entradas estéreo recebem o mesmo sinal.
     pub fn process(&self, io: &mut VstIo, x: &mut [f32]) {
-        if self.failed.load(Relaxed) || self.n_out == 0 {
+        if self.failed.load(Relaxed) || self.n_out == 0 || x.len() != FRAME {
             return;
         }
         for (i, b) in io.ins.iter_mut().enumerate() {
@@ -325,20 +331,25 @@ impl VstPlugin {
         }
         unsafe { ((*self.eff).process_replacing)(self.eff, io.inp.as_mut_ptr(), io.outp.as_mut_ptr(), FRAME as i32) };
         let k = self.n_out.min(2);
-        let mut ok = true;
-        for (j, v) in x.iter_mut().enumerate() {
-            let mut s = io.outs[0][j];
-            if k == 2 {
-                s = 0.5 * (s + io.outs[1][j]);
-            }
-            if !s.is_finite() || s.abs() > 1e4 {
-                ok = false;
-                break;
-            }
-            *v = s;
-        }
+        let ok = if k == 2 {
+            io.outs[0].iter().zip(&io.outs[1]).all(|(&a, &b)| {
+                let s = 0.5 * (a + b);
+                s.is_finite() && s.abs() <= 1e4
+            })
+        } else {
+            io.outs[0].iter().all(|&s| s.is_finite() && s.abs() <= 1e4)
+        };
         if !ok {
+            x.fill(0.0);
             self.failed.store(true, Relaxed);
+            return;
+        }
+        if k == 2 {
+            for (j, v) in x.iter_mut().enumerate() {
+                *v = 0.5 * (io.outs[0][j] + io.outs[1][j]);
+            }
+        } else {
+            x.copy_from_slice(&io.outs[0]);
         }
     }
 }

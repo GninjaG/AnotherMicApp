@@ -5,6 +5,8 @@ use micclean::fx::biquad::Coefs;
 use micclean::fx::chain::{BlockCfg, GeqMode, Kind};
 use micclean::fx::{geq, loudness};
 use realfft::{RealFftPlanner, RealToComplex};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 const FMIN: f64 = 20.0;
@@ -18,7 +20,10 @@ pub struct Spectrum {
     win: Vec<f32>,
     inp: Vec<f32>,
     out: Vec<realfft::num_complex::Complex<f32>>,
+    scratch: Vec<realfft::num_complex::Complex<f32>>,
     pub db: Vec<f32>,
+    dirty: bool,
+    pub active: bool,
 }
 
 impl Spectrum {
@@ -30,32 +35,49 @@ impl Spectrum {
             pos: 0,
             inp: fft.make_input_vec(),
             out: fft.make_output_vec(),
+            scratch: fft.make_scratch_vec(),
             fft,
             win,
             db: vec![-120.0; NFFT / 2 + 1],
+            dirty: false,
+            active: false,
         }
     }
 
     pub fn push(&mut self, x: &[f32]) {
+        if x.is_empty() {
+            return;
+        }
         for &v in x {
             self.buf[self.pos] = v;
             self.pos = (self.pos + 1) % NFFT;
         }
+        self.dirty = true;
+        self.active = true;
     }
 
     /// Atualiza o espectro suavizado (sobe rápido, desce devagar).
     pub fn update(&mut self) {
+        if !self.dirty && !self.active {
+            return;
+        }
         for i in 0..NFFT {
             self.inp[i] = self.buf[(self.pos + i) % NFFT] * self.win[i];
         }
-        if self.fft.process(&mut self.inp, &mut self.out).is_err() {
+        if self.fft.process_with_scratch(&mut self.inp, &mut self.out, &mut self.scratch).is_err() {
             return;
         }
         let norm = 2.0 / (NFFT as f32 * 0.5);
+        let mut active = false;
         for (d, c) in self.db.iter_mut().zip(&self.out) {
             let v = 20.0 * (c.norm() * norm + 1e-9).log10();
             *d = if v > *d { *d * 0.4 + v * 0.6 } else { *d * 0.88 + v * 0.12 };
+            if *d > -119.5 {
+                active = true;
+            }
         }
+        self.dirty = false;
+        self.active = active;
     }
 
     fn at(&self, f: f64) -> f32 {
@@ -68,17 +90,37 @@ impl Spectrum {
     }
 }
 
-pub fn block_gain(b: &BlockCfg, f: f64, vol_db: f64) -> f64 {
-    let sr = SR as f64;
-    match &b.kind {
-        Kind::Preamp { gain_db } => *gain_db,
-        Kind::Filter { p } => Coefs::new(p, sr).gain_at(f, sr),
-        Kind::GraphicEq { nodes, .. } => geq::gain_at(nodes, f),
-        Kind::Loudness { ref_level, ref_offset, attenuation } => {
-            let c = loudness::coefs(*ref_level, *ref_offset, *attenuation, vol_db, sr);
-            if c.neutral { 0.0 } else { c.ls.gain_at(f, sr) + c.hs.gain_at(f, sr) + 20.0 * c.att.log10() }
+enum Precomputed<'a> {
+    Preamp(f64),
+    Filter(Coefs),
+    Geq(&'a [(f64, f64)]),
+    Loud(loudness::LoudCoefs, f64),
+}
+
+impl<'a> Precomputed<'a> {
+    fn from_block(b: &'a BlockCfg, vol_db: f64, sr: f64) -> Option<Self> {
+        match &b.kind {
+            Kind::Preamp { gain_db } => Some(Self::Preamp(*gain_db)),
+            Kind::Filter { p } => Some(Self::Filter(Coefs::new(p, sr))),
+            Kind::GraphicEq { nodes, .. } => Some(Self::Geq(nodes)),
+            Kind::Loudness { ref_level, ref_offset, attenuation } => {
+                let c = loudness::coefs(*ref_level, *ref_offset, *attenuation, vol_db, sr);
+                let att_db = if c.neutral { 0.0 } else { 20.0 * c.att.log10() };
+                Some(Self::Loud(c, att_db))
+            }
+            _ => None,
         }
-        _ => 0.0,
+    }
+
+    fn gain_at(&self, f: f64, sr: f64) -> f64 {
+        match self {
+            Self::Preamp(g) => *g,
+            Self::Filter(c) => c.gain_at(f, sr),
+            Self::Geq(nodes) => geq::gain_at(nodes, f),
+            Self::Loud(c, att_db) => {
+                if c.neutral { 0.0 } else { c.ls.gain_at(f, sr) + c.hs.gain_at(f, sr) + *att_db }
+            }
+        }
     }
 }
 
@@ -86,8 +128,54 @@ fn shapes_response(b: &BlockCfg) -> bool {
     matches!(b.kind, Kind::Preamp { .. } | Kind::Filter { .. } | Kind::GraphicEq { .. } | Kind::Loudness { .. })
 }
 
+fn hash_shaping(blocks: &[BlockCfg]) -> u64 {
+    let mut h = DefaultHasher::new();
+    for b in blocks.iter().filter(|b| b.enabled && shapes_response(b)) {
+        b.id.hash(&mut h);
+        match &b.kind {
+            Kind::Preamp { gain_db } => {
+                0u8.hash(&mut h);
+                gain_db.to_bits().hash(&mut h);
+            }
+            Kind::Filter { p } => {
+                1u8.hash(&mut h);
+                (p.kind as u8).hash(&mut h);
+                p.freq.to_bits().hash(&mut h);
+                p.gain.to_bits().hash(&mut h);
+                p.width.to_bits().hash(&mut h);
+                (p.width_kind as u8).hash(&mut h);
+                p.corner.hash(&mut h);
+            }
+            Kind::GraphicEq { nodes, .. } => {
+                2u8.hash(&mut h);
+                nodes.len().hash(&mut h);
+                for (f, g) in nodes {
+                    f.to_bits().hash(&mut h);
+                    g.to_bits().hash(&mut h);
+                }
+            }
+            Kind::Loudness { ref_level, ref_offset, attenuation } => {
+                3u8.hash(&mut h);
+                ref_level.to_bits().hash(&mut h);
+                ref_offset.to_bits().hash(&mut h);
+                attenuation.to_bits().hash(&mut h);
+            }
+            _ => {}
+        }
+    }
+    h.finish()
+}
+
+struct CurveCache {
+    key: (usize, bool, u64, u64),
+    freqs: Vec<f64>,
+    total: Vec<f64>,
+    range: f64,
+}
+
 pub struct Graph {
     pub drag: Option<(u32, usize)>,
+    cache: Option<CurveCache>,
 }
 
 pub enum GraphEdit {
@@ -120,7 +208,7 @@ impl Map {
 
 impl Graph {
     pub fn new() -> Graph {
-        Graph { drag: None }
+        Graph { drag: None, cache: None }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -143,11 +231,26 @@ impl Graph {
         let r = Rect::from_min_max(outer.min + vec2(42.0, 14.0), outer.max - vec2(14.0, 26.0));
 
         let n = (r.width() as usize / 2).max(64);
-        let freqs: Vec<f64> = (0..=n).map(|i| FMIN * (FMAX / FMIN).powf(i as f64 / n as f64)).collect();
-        let live: Vec<&BlockCfg> = blocks.iter().filter(|b| b.enabled && shapes_response(b)).collect();
-        let total: Vec<f64> = freqs.iter().map(|&f| if bypass { 0.0 } else { live.iter().map(|b| block_gain(b, f, vol_db)).sum() }).collect();
-        let peak = total.iter().fold(0.0f64, |m, g| m.max(g.abs()));
-        let range = [12.0, 18.0, 24.0, 36.0, 48.0].into_iter().find(|&v| peak <= v - 1.0).unwrap_or(60.0);
+        let key = (n, bypass, vol_db.to_bits(), if bypass { 0 } else { hash_shaping(blocks) });
+        if self.cache.as_ref().is_none_or(|c| c.key != key) {
+            let sr = SR as f64;
+            let freqs: Vec<f64> = (0..=n).map(|i| FMIN * (FMAX / FMIN).powf(i as f64 / n as f64)).collect();
+            let total: Vec<f64> = if bypass {
+                vec![0.0; freqs.len()]
+            } else {
+                let pre: Vec<Precomputed> = blocks
+                    .iter()
+                    .filter(|b| b.enabled && shapes_response(b))
+                    .filter_map(|b| Precomputed::from_block(b, vol_db, sr))
+                    .collect();
+                freqs.iter().map(|&f| pre.iter().map(|pr| pr.gain_at(f, sr)).sum()).collect()
+            };
+            let peak = total.iter().fold(0.0f64, |m, g| m.max(g.abs()));
+            let range = [12.0, 18.0, 24.0, 36.0, 48.0].into_iter().find(|&v| peak <= v - 1.0).unwrap_or(60.0);
+            self.cache = Some(CurveCache { key, freqs, total, range });
+        }
+        let cache = self.cache.as_ref().unwrap();
+        let (freqs, total, range) = (&cache.freqs, &cache.total, cache.range);
         let m = Map { r, range };
 
         // grade
@@ -169,7 +272,7 @@ impl Graph {
         }
 
         // espectro da saída (-90..0 dBFS ocupa a altura toda)
-        if let Some(s) = spec.filter(|s| s.db.iter().any(|&d| d > -100.0)) {
+        if let Some(s) = spec.filter(|s| s.active && s.db.iter().any(|&d| d > -100.0)) {
             let pts: Vec<Pos2> = freqs
                 .iter()
                 .map(|&f| {
@@ -178,13 +281,19 @@ impl Graph {
                 })
                 .collect();
             let fill = Color32::from_rgba_unmultiplied(0xe2, 0x4a, 0x76, 18);
-            for w in pts.windows(2) {
-                p.add(Shape::convex_polygon(
-                    vec![w[0], w[1], pos2(w[1].x, r.bottom()), pos2(w[0].x, r.bottom())],
-                    fill,
-                    Stroke::NONE,
-                ));
+            let mut mesh = egui::Mesh::default();
+            mesh.vertices.reserve(pts.len() * 2);
+            mesh.indices.reserve(pts.len().saturating_sub(1) * 6);
+            for (idx, &pt) in pts.iter().enumerate() {
+                mesh.colored_vertex(pt, fill);
+                mesh.colored_vertex(pos2(pt.x, r.bottom()), fill);
+                if idx > 0 {
+                    let base = (idx as u32 - 1) * 2;
+                    mesh.add_triangle(base, base + 2, base + 3);
+                    mesh.add_triangle(base, base + 3, base + 1);
+                }
             }
+            p.add(Shape::mesh(mesh));
             p.add(Shape::line(pts, Stroke::new(1.0, Color32::from_rgba_unmultiplied(0xe2, 0x4a, 0x76, 70))));
         }
 
@@ -193,11 +302,11 @@ impl Graph {
         }
 
         // curva do bloco selecionado
-        if let Some(b) = sel.and_then(|id| blocks.iter().find(|b| b.id == id)).filter(|b| shapes_response(b)) {
-            let pts: Vec<Pos2> = freqs.iter().map(|&f| pos2(m.x(f), m.y(block_gain(b, f, vol_db)))).collect();
+        if let Some(pre) = sel.and_then(|id| blocks.iter().find(|b| b.id == id)).and_then(|b| Precomputed::from_block(b, vol_db, SR as f64)) {
+            let pts: Vec<Pos2> = freqs.iter().map(|&f| pos2(m.x(f), m.y(pre.gain_at(f, SR as f64)))).collect();
             p.add(Shape::line(pts, Stroke::new(1.2, Color32::from_rgba_unmultiplied(0xee, 0xe6, 0xec, 60))));
         }
-        let pts: Vec<Pos2> = freqs.iter().zip(&total).map(|(&f, &g)| pos2(m.x(f), m.y(g))).collect();
+        let pts: Vec<Pos2> = freqs.iter().zip(total).map(|(&f, &g)| pos2(m.x(f), m.y(g))).collect();
         p.add(Shape::line(pts, Stroke::new(2.0, if bypass { MUTED } else { ACCENT })));
 
         // pontos arrastáveis
@@ -249,6 +358,18 @@ impl Graph {
                                 n.0 = (f * 10.0).round() / 10.0;
                             }
                             n.1 = (g * 10.0).round() / 10.0;
+                            if *mode == GeqMode::Free {
+                                let mut cur = i;
+                                while cur > 0 && nodes[cur].0 < nodes[cur - 1].0 {
+                                    nodes.swap(cur, cur - 1);
+                                    cur -= 1;
+                                }
+                                while cur + 1 < nodes.len() && nodes[cur].0 > nodes[cur + 1].0 {
+                                    nodes.swap(cur, cur + 1);
+                                    cur += 1;
+                                }
+                                self.drag = Some((id, cur));
+                            }
                             edits.push(GraphEdit::Geq(id));
                         }
                     }

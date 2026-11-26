@@ -140,6 +140,8 @@ impl Loud {
             let y = self.ls.tick(*v as f64) * att;
             *v = self.hs.tick(y) as f32;
         }
+        self.ls.flush_denormals();
+        self.hs.flush_denormals();
     }
 }
 
@@ -209,7 +211,13 @@ impl Builder<'_> {
             Kind::Denoise { .. } => (Fx::Denoise, None),
             Kind::Preamp { gain_db } => (Fx::Gain(db(*gain_db)), None),
             Kind::Filter { p } => (Fx::Bq(Biquad::new(Coefs::new(p, SR as f64))), None),
-            Kind::GraphicEq { nodes, .. } => (Fx::Conv(Box::new(Conv::new(&super::geq::design(nodes, SR as f64)))), None),
+            Kind::GraphicEq { nodes, .. } => {
+                if nodes.iter().all(|(_, g)| g.abs() < 1e-6) {
+                    (Fx::Conv(Box::new(Conv::new(&[1.0]))), None)
+                } else {
+                    (Fx::Conv(Box::new(Conv::new(&super::geq::design(nodes, SR as f64)))), None)
+                }
+            }
             Kind::Loudness { ref_level, ref_offset, attenuation } => {
                 (Fx::Loud(Loud::new(super::loudness::coefs(*ref_level, *ref_offset, *attenuation, self.vol_db, SR as f64))), None)
             }
@@ -266,6 +274,7 @@ pub enum Garbage {
     Chain(Box<Chain>),
     Fx(Box<Fx>),
     Str(String),
+    Dfn(crate::dsp::Moved<crate::dsp::Dfn>),
 }
 
 impl Chain {

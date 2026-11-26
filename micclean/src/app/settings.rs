@@ -7,12 +7,14 @@ use wasapi::Direction;
 #[derive(Default)]
 pub struct Settings {
     pub open: bool,
+    was_open: bool,
     caps: Vec<DevInfo>,
     rends: Vec<DevInfo>,
     loaded: bool,
     capture: Option<usize>,
     seen: u64,
     programs: Vec<String>,
+    vst_dir_exists: Vec<bool>,
     pub hotkey_err: Option<String>,
     lat: super::cable::CableUi,
 }
@@ -151,6 +153,7 @@ impl Settings {
         let mut out = vec![];
         if !self.open {
             self.capture = None;
+            self.was_open = false;
         }
         // continua desenhando enquanto a janela esmaece ao fechar
         if ctx.animate_bool_responsive(egui::Id::unique("settings-vis"), self.open) <= 0.0 {
@@ -159,6 +162,10 @@ impl Settings {
         if !self.loaded || self.seen != audio::hotplug() {
             self.refresh();
         }
+        if (self.open && !self.was_open) || self.vst_dir_exists.len() != cfg.app.vst_dirs.len() {
+            self.vst_dir_exists = cfg.app.vst_dirs.iter().map(|d| std::path::Path::new(d).is_dir()).collect();
+        }
+        self.was_open = self.open;
         if let Some(k) = self.capture {
             let got = ctx.input(|i| {
                 i.events.iter().find_map(|e| match e {
@@ -188,7 +195,7 @@ impl Settings {
                 let bg = ui.clip_rect();
                 hearts(ui.painter(), bg, if anim { ui.input(|i| i.time) } else { 0.0 });
                 if anim {
-                    ctx.request_repaint();
+                    ctx.request_repaint_after(std::time::Duration::from_millis(33));
                 }
                 let h = (ctx.content_rect().height() - 150.0).max(300.0);
                 egui::ScrollArea::vertical().max_height(h).min_scrolled_height(h).show(ui, |ui| {
@@ -352,7 +359,7 @@ impl Settings {
                         });
                         for (k, dir) in cfg.app.vst_dirs.iter().enumerate() {
                             ui.horizontal(|ui| {
-                                let exists = std::path::Path::new(dir).is_dir();
+                                let exists = self.vst_dir_exists.get(k).copied().unwrap_or(false);
                                 let (r, _) = ui.allocate_exact_size(vec2(8.0, 18.0), egui::Sense::hover());
                                 ui.painter().circle_filled(r.center(), 3.0, if exists { OK } else { FAINT });
                                 ui.add(egui::Label::new(RichText::new(dir).color(if exists { TEXT } else { FAINT }).size(12.5)).truncate());
@@ -369,10 +376,14 @@ impl Settings {
                     });
                     if let Some(k) = del {
                         cfg.app.vst_dirs.remove(k);
+                        if k < self.vst_dir_exists.len() {
+                            self.vst_dir_exists.remove(k);
+                        }
                         out.push(SetEdit::VstDirs);
                     }
                     if ui.button(t!("Adicionar pasta", "Add folder")).clicked() {
                         if let Some(p) = rfd::FileDialog::new().set_title(t!("Pasta de plugins VST", "VST plugin folder")).pick_folder() {
+                            self.vst_dir_exists.push(p.is_dir());
                             cfg.app.vst_dirs.push(p.to_string_lossy().into_owned());
                             out.push(SetEdit::VstDirs);
                         }
